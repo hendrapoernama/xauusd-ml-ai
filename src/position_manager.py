@@ -274,6 +274,9 @@ class SmartPositionManager:
         trail_step_pips: float = 10.0,     # Fallback if ATR unavailable
         min_profit_to_protect: float = 50.0,  # Minimum $ profit to protect
         max_drawdown_from_peak: float = 30.0,  # Max % drawdown from peak profit
+        # Dollar-based trailing stop (simpler, always active regardless of ATR)
+        trail_start_usd: float = 3.0,      # Start trailing when profit >= $3
+        trail_distance_pips: float = 15.0, # Trail distance in pips (15 pips = $1.5 for 0.01 lot)
         # ATR-adaptive exit multipliers (#24B: backtest +$373)
         atr_be_mult: float = 2.0,          # Breakeven = ATR * 2.0
         atr_trail_start_mult: float = 4.0, # Trail start = ATR * 4.0
@@ -291,6 +294,8 @@ class SmartPositionManager:
         self.atr_trail_step_mult = atr_trail_step_mult
         self.min_profit_to_protect = min_profit_to_protect
         self.max_drawdown_from_peak = max_drawdown_from_peak
+        self.trail_start_usd = trail_start_usd
+        self.trail_distance_pips = trail_distance_pips
 
         # Initialize market close handler
         self.enable_market_close_handler = enable_market_close_handler
@@ -551,6 +556,39 @@ class SmartPositionManager:
                 action="CLOSE",
                 reason=f"High urgency exit (score: {market['urgency']}) - Securing ${profit:.2f}",
             )
+
+        # === TRAILING STOP: USD-BASED (runs first — always active, no ATR dependency) ===
+        # Configurable via TRAIL_START_USD and TRAIL_DISTANCE_PIPS in .env
+        # Progressive: tighten trail distance as profit grows
+        if profit >= self.trail_start_usd:
+            # Progressive trail distance based on profit level
+            if profit >= self.trail_start_usd * 5:       # e.g. >= $15 → very tight
+                active_trail_pips = max(8.0, self.trail_distance_pips * 0.60)
+            elif profit >= self.trail_start_usd * 3:     # e.g. >= $9  → tight
+                active_trail_pips = max(10.0, self.trail_distance_pips * 0.75)
+            else:                                         # e.g. >= $3  → normal
+                active_trail_pips = self.trail_distance_pips
+
+            trail_dist_price = active_trail_pips * 0.1  # Convert pips → price (gold: 1 pip = $0.1)
+
+            if is_buy:
+                new_trail_sl = current_price - trail_dist_price
+                if current_sl < new_trail_sl:            # Only move SL up, never down
+                    return PositionAction(
+                        ticket=ticket,
+                        action="TRAIL_SL",
+                        reason=f"Trail(USD) profit=${profit:.2f} SL→{new_trail_sl:.2f} dist={active_trail_pips:.0f}pips",
+                        new_sl=new_trail_sl,
+                    )
+            else:  # SELL
+                new_trail_sl = current_price + trail_dist_price
+                if current_sl > new_trail_sl or current_sl == 0:
+                    return PositionAction(
+                        ticket=ticket,
+                        action="TRAIL_SL",
+                        reason=f"Trail(USD) profit=${profit:.2f} SL→{new_trail_sl:.2f} dist={active_trail_pips:.0f}pips",
+                        new_sl=new_trail_sl,
+                    )
 
         # === TRAILING STOP CONDITIONS (ATR-adaptive #24B) ===
 

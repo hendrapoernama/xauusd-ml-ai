@@ -123,7 +123,14 @@ class TelegramNotifier:
         """Get or create aiohttp session."""
         if self._session is None:
             import aiohttp
-            self._session = aiohttp.ClientSession()
+            if os.getenv("TELEGRAM_DISABLE_SSL_VERIFY", "false").lower() == "true":
+                import ssl
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                self._session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context))
+            else:
+                self._session = aiohttp.ClientSession()
         return self._session
 
     async def close(self):
@@ -140,7 +147,8 @@ class TelegramNotifier:
     ) -> bool:
         """Send a text message to Telegram."""
         if not self.enabled:
-            return True
+            logger.debug("Telegram disabled (no BOT_TOKEN/CHAT_ID) — message not sent")
+            return False
 
         try:
             session = await self._get_session()
@@ -445,90 +453,116 @@ class TelegramNotifier:
         return msg.strip()
 
     def _format_trade_close(self, trade: TradeInfo, ctx: dict) -> str:
-        """Format trade close notification with ALL status as text array."""
-        # Determine profit/loss styling
+        """Format trade close notification — rich PNL layout."""
+        DIV = "━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # ── Result label & emoji ──────────────────────────────────────
         if trade.profit > 0:
-            emoji = "✅"
-            profit_str = f"+${trade.profit:.2f}"
+            result_emoji = "✅"
+            result_label = "PROFIT"
+            pnl_sign     = "+"
         elif trade.profit < 0:
-            emoji = "❌"
-            profit_str = f"-${abs(trade.profit):.2f}"
+            result_emoji = "❌"
+            result_label = "LOSS"
+            pnl_sign     = "-"
         else:
-            emoji = "➖"
-            profit_str = "$0"
+            result_emoji = "➖"
+            result_label = "BREAKEVEN"
+            pnl_sign     = ""
 
-        # Calculate percentage change
-        pct_change = (trade.profit / trade.balance_before * 100) if trade.balance_before > 0 else 0
-        pct_str = f"+{pct_change:.2f}%" if pct_change >= 0 else f"{pct_change:.2f}%"
+        direction_emoji = "🟢" if trade.order_type == "BUY" else "🔴"
+        direction_label = "LONG" if trade.order_type == "BUY" else "SHORT"
 
-        # Duration formatting
-        duration_mins = trade.duration_seconds // 60
-        duration_str = f"{duration_mins}m" if duration_mins > 0 else f"{trade.duration_seconds}s"
+        # ── PNL numbers ───────────────────────────────────────────────
+        pnl_abs  = abs(trade.profit)
+        pnl_pct  = abs(trade.profit / trade.balance_before * 100) if trade.balance_before > 0 else 0
+        pips_abs = abs(trade.profit_pips)
+        pnl_str  = f"{pnl_sign}${pnl_abs:.2f}"
+        pct_str  = f"({pnl_sign}{pnl_pct:.2f}%)"
 
-        # Result label
-        if trade.profit > 0:
-            result = "WIN"
-        elif trade.profit < 0:
-            result = "LOSS"
+        # ── Duration ─────────────────────────────────────────────────
+        h = trade.duration_seconds // 3600
+        m = (trade.duration_seconds % 3600) // 60
+        s = trade.duration_seconds % 60
+        if h > 0:
+            dur_str = f"{h}j {m}m"
+        elif m > 0:
+            dur_str = f"{m}m {s}s"
         else:
-            result = "BE"
+            dur_str = f"{s}s"
 
-        # Balance change
+        # ── Price movement arrow ──────────────────────────────────────
+        price_diff = (trade.close_price or 0) - trade.entry_price
+        arrow = "↑" if price_diff >= 0 else "↓"
+
+        # ── Balance ───────────────────────────────────────────────────
         bal_change = trade.balance_after - trade.balance_before
-        bal_change_str = f"+${bal_change:.2f}" if bal_change >= 0 else f"-${abs(bal_change):.2f}"
+        bal_pct    = (bal_change / trade.balance_before * 100) if trade.balance_before > 0 else 0
+        bal_sign   = "+" if bal_change >= 0 else ""
+        bal_arrow  = "📈" if bal_change >= 0 else "📉"
 
-        # Win rate
-        win_rate = ctx.get("win_rate", 0)
-        session_trades = ctx.get("session_trades", 0)
-        session_wins = ctx.get("session_wins", 0)
+        # ── Session stats ─────────────────────────────────────────────
+        session_trades  = ctx.get("session_trades", 0)
+        session_wins    = ctx.get("session_wins", 0)
+        session_losses  = session_trades - session_wins
+        win_rate        = ctx.get("win_rate", 0)
+        session_profit  = ctx.get("session_profit", 0)
+        daily_profit    = ctx.get("daily_profit", 0)
+        daily_loss      = ctx.get("daily_loss", 0)
+        consec_loss     = ctx.get("consecutive_losses", 0)
+        risk_mode       = ctx.get("risk_mode", "normal").upper()
+        session_pnl_sign = "+" if session_profit >= 0 else ""
 
-        # === Section 1: Trade Result ===
-        trade_items = [
-            f"<b>{trade.symbol}</b> {trade.order_type}",
-            f"Entry: <code>{trade.entry_price:.2f}</code> -> Exit: <code>{trade.close_price:.2f}</code>",
-            f"Lot: <code>{trade.lot_size}</code> | Pips: <code>{trade.profit_pips:+.1f}</code>",
-            f"<b>P/L: {profit_str}</b> ({pct_str})",
-            f"Duration: <code>{duration_str}</code>",
-        ]
+        # ── Win rate bar (10 chars) ────────────────────────────────────
+        filled = round(win_rate / 10)
+        wr_bar = "█" * filled + "░" * (10 - filled)
 
-        # === Section 2: Exit ===
-        exit_reason = ctx.get("exit_reason", "unknown")
-        exit_items = [
-            f"Reason: <code>{exit_reason}</code>",
-            f"Regime: <code>{trade.regime or 'unknown'}</code> | Vol: <code>{trade.volatility or 'unknown'}</code>",
-            f"Session: <code>{ctx.get('session', 'Unknown')}</code>",
-        ]
+        # ── Exit reason (cleaned) ─────────────────────────────────────
+        exit_reason = ctx.get("exit_reason", "—")
+        # Truncate long reason strings
+        if len(exit_reason) > 60:
+            exit_reason = exit_reason[:57] + "..."
 
-        # === Section 3: Balance ===
-        balance_items = [
-            f"Before: <code>${trade.balance_before:,.2f}</code>",
-            f"After: <code>${trade.balance_after:,.2f}</code> (<b>{bal_change_str}</b>)",
-        ]
+        # ── Timestamp ─────────────────────────────────────────────────
+        now      = datetime.now(WIB)
+        day_name = ["Sen","Sel","Rab","Kam","Jum","Sab","Min"][now.weekday()]
+        ts_str   = f"{day_name} {now.strftime('%d %b %Y')}  ·  {now.strftime('%H:%M')} WIB"
 
-        # === Section 4: Session Stats ===
-        session_profit = ctx.get("session_profit", 0)
-        session_pnl_str = f"+${session_profit:.2f}" if session_profit >= 0 else f"-${abs(session_profit):.2f}"
-        consec = ctx.get("consecutive_losses", 0)
-
-        stats_items = [
-            f"Trades: <code>{session_wins}W</code> / <code>{session_trades}T</code>",
-            f"Win Rate: <code>{win_rate:.1f}%</code>",
-            f"Session P/L: <b>{session_pnl_str}</b>",
-            f"Streak: <code>{consec}L</code> | Mode: <code>{ctx.get('risk_mode', 'normal').upper()}</code>",
-        ]
-
-        # === Build message ===
-        msg = f"""{emoji} <b>{result}</b> #{trade.ticket}
-
-{self._build_section("Trade", trade_items)}
-
-{self._build_section("Exit", exit_items)}
-
-{self._build_section("Balance", balance_items)}
-
-{self._build_section("Session Stats", stats_items)}
-
-⏰ {datetime.now(WIB).strftime('%H:%M')} WIB"""
+        msg = (
+            f"{DIV}\n"
+            f"{result_emoji} <b>{result_label}</b>  {direction_emoji} <b>{direction_label}</b>  ·  #{trade.ticket}\n"
+            f"{DIV}\n"
+            f"\n"
+            f"<b>💰 P/L:  <code>{pnl_str}</code>  {pct_str}</b>\n"
+            f"📊 Pips:  <code>{pips_abs:.1f}</code>  ·  Lot: <code>{trade.lot_size}</code>\n"
+            f"\n"
+            f"🔢 <b>Harga</b>\n"
+            f"   Entry : <code>{trade.entry_price:.2f}</code>\n"
+            f"   Exit  : <code>{trade.close_price:.2f}</code>  {arrow}  <code>{price_diff:+.2f}</code>\n"
+            f"   Symbol: <code>{trade.symbol}</code>  ·  Durasi: <code>{dur_str}</code>\n"
+            f"\n"
+            f"{DIV}\n"
+            f"{bal_arrow} <b>Akun</b>\n"
+            f"   Sebelum : <code>${trade.balance_before:,.2f}</code>\n"
+            f"   Sesudah : <code>${trade.balance_after:,.2f}</code>\n"
+            f"   Berubah : <b><code>{bal_sign}${abs(bal_change):.2f}</code>  ({bal_sign}{bal_pct:.2f}%)</b>\n"
+            f"\n"
+            f"{DIV}\n"
+            f"📈 <b>Statistik Sesi</b>\n"
+            f"   Trade  : <code>{session_wins}W</code> / <code>{session_losses}L</code> / <code>{session_trades}T</code>\n"
+            f"   WR     : <code>{win_rate:.1f}%</code>  [{wr_bar}]\n"
+            f"   Sesi   : <b><code>{session_pnl_sign}${abs(session_profit):.2f}</code></b>  ·  "
+            f"Daily: <code>+${daily_profit:.2f}</code> / <code>-${abs(daily_loss):.2f}</code>\n"
+            f"   Streak : <code>{consec_loss}L</code>  ·  Mode: <code>{risk_mode}</code>\n"
+            f"\n"
+            f"{DIV}\n"
+            f"🧠 <b>Konteks</b>\n"
+            f"   Regime  : <code>{trade.regime or 'unknown'}</code>  ·  Vol: <code>{trade.volatility or 'unknown'}</code>\n"
+            f"   Session : <code>{ctx.get('session', 'Unknown')}</code>  ·  ML: <code>{trade.ml_confidence:.0%}</code>\n"
+            f"   Exit    : <i>{exit_reason}</i>\n"
+            f"\n"
+            f"⏰ <i>{ts_str}</i>"
+        )
         return msg.strip()
 
     def _format_market_update(self, condition: MarketCondition, ctx: dict) -> str:
@@ -760,8 +794,11 @@ class TelegramNotifier:
         )
 
         msg = self._format_trade_open(trade, context or {})
-        await self.send_message(msg)
-        logger.info(f"Telegram: Trade open notification sent for #{ticket}")
+        ok = await self.send_message(msg)
+        if ok:
+            logger.info(f"Telegram: Trade open notification sent for #{ticket}")
+        else:
+            logger.warning(f"Telegram: Trade open notification NOT sent for #{ticket} (disabled or send failed)")
 
     async def notify_trade_close(
         self,
@@ -804,8 +841,11 @@ class TelegramNotifier:
         self._daily_trades.append(trade)
 
         msg = self._format_trade_close(trade, context or {})
-        await self.send_message(msg)
-        logger.info(f"Telegram: Trade close notification sent for #{ticket}")
+        ok = await self.send_message(msg)
+        if ok:
+            logger.info(f"Telegram: Trade close notification sent for #{ticket}")
+        else:
+            logger.warning(f"Telegram: Trade close notification NOT sent for #{ticket} (disabled or send failed)")
 
     async def notify_market_update(
         self,

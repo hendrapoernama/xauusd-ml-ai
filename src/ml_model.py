@@ -69,18 +69,20 @@ class TradingModel:
         # Default XGBoost parameters - TUNED TO PREVENT OVERFITTING
         self.params = params or {
             "objective": "binary:logistic",
-            "eval_metric": "auc",
-            "max_depth": 3,            # Reduced from 6 to prevent overfitting
-            "learning_rate": 0.05,     # Reduced from 0.1 for smoother learning
+            # logloss as primary (always valid, even with single-class eval set).
+            # auc is appended dynamically in fit() only when eval has both classes.
+            "eval_metric": "logloss",
+            "max_depth": 3,
+            "learning_rate": 0.05,
             "tree_method": "hist",
             "device": "cpu",
-            "min_child_weight": 10,    # Increased from 1 to require more samples per leaf
-            "subsample": 0.7,          # Reduced from 0.8 for more regularization
-            "colsample_bytree": 0.6,   # Reduced from 0.8 for more regularization
-            "reg_alpha": 1.0,          # Increased L1 regularization (was 0.1)
-            "reg_lambda": 5.0,         # Increased L2 regularization (was 1.0)
-            "gamma": 1.0,              # Added minimum loss reduction for split
-            "max_delta_step": 1,       # Added to help with imbalanced classes
+            "min_child_weight": 10,
+            "subsample": 0.7,
+            "colsample_bytree": 0.6,
+            "reg_alpha": 1.0,
+            "reg_lambda": 5.0,
+            "gamma": 1.0,
+            "max_delta_step": 1,
         }
         
         self.model: Optional[xgb.Booster] = None
@@ -121,19 +123,43 @@ class TradingModel:
         if target_col not in df.columns:
             logger.error(f"Target column '{target_col}' not found")
             return self
-        
-        df_clean = df.select(available_features + [target_col]).drop_nulls()
-        
+
+        # Only require TARGET to be non-null — fill feature NaNs with 0
+        df_work = df.select(available_features + [target_col])
+        df_work = df_work.filter(pl.col(target_col).is_not_null())
+
+        # Drop feature columns with >80% null
+        bad_cols = [
+            col for col in available_features
+            if df_work[col].null_count() / max(len(df_work), 1) > 0.80
+        ]
+        if bad_cols:
+            logger.warning(f"Dropping {len(bad_cols)} features with >80% null: {bad_cols[:5]}{'...' if len(bad_cols) > 5 else ''}")
+            available_features = [f for f in available_features if f not in bad_cols]
+
+        # Fill remaining nulls with 0
+        float_cols = [f for f in available_features if df_work[f].dtype in (pl.Float64, pl.Float32)]
+        int_cols   = [f for f in available_features if df_work[f].dtype in (pl.Int64, pl.Int32, pl.Int8)]
+        fill_exprs = (
+            [pl.col(c).fill_nan(0.0).fill_null(0.0) for c in float_cols] +
+            [pl.col(c).fill_null(0) for c in int_cols]
+        )
+        if fill_exprs:
+            df_work = df_work.with_columns(fill_exprs)
+
+        df_clean = df_work.select(available_features + [target_col])
+        logger.info(f"Training data: {len(df_clean)} samples, {len(available_features)} features")
+
         if len(df_clean) < 100:
             logger.warning(f"Insufficient data for training: {len(df_clean)} samples")
             return self
-        
+
         self.feature_names = available_features
-        
+
         # Extract features and target
         X = df_clean.select(available_features).to_numpy()
         y = df_clean.select(target_col).to_numpy().ravel()
-        
+
         # Handle any NaN/inf
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         
@@ -156,16 +182,33 @@ class TradingModel:
         logger.info(f"Train/Test gap: {test_start_idx - split_idx} bars to prevent temporal leakage")
         
         logger.info(f"Training with {len(X_train)} samples, testing with {len(X_test)} samples")
-        
+
+        # Log class distribution
+        train_counts = dict(zip(*np.unique(y_train, return_counts=True)))
+        test_counts  = dict(zip(*np.unique(y_test,  return_counts=True)))
+        logger.info(f"Train class distribution: {train_counts}")
+        logger.info(f"Test  class distribution: {test_counts}")
+
         # Create DMatrix
         dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=available_features)
-        dtest = xgb.DMatrix(X_test, label=y_test, feature_names=available_features)
-        
-        # Train model
-        evals = [(dtrain, "train"), (dtest, "eval")]
-        
+        dtest  = xgb.DMatrix(X_test,  label=y_test,  feature_names=available_features)
+
+        # Only add auc to eval_metric when test set has both classes
+        run_params = dict(self.params)
+        test_has_both_classes = len(test_counts) >= 2
+        if test_has_both_classes:
+            run_params["eval_metric"] = ["logloss", "auc"]
+            evals = [(dtrain, "train"), (dtest, "eval")]
+        else:
+            logger.warning(
+                f"Test set contains only class {list(test_counts.keys())[0]} — "
+                "AUC skipped, using train-only eval to avoid NaN."
+            )
+            run_params["eval_metric"] = "logloss"
+            evals = [(dtrain, "train")]
+
         self.model = xgb.train(
-            self.params,
+            run_params,
             dtrain,
             num_boost_round=num_boost_round,
             evals=evals,
@@ -183,8 +226,8 @@ class TradingModel:
         
         # Calculate and log training results
         train_auc = self._evaluate(dtrain)
-        test_auc = self._evaluate(dtest)
-        
+        test_auc  = self._evaluate(dtest) if test_has_both_classes else float("nan")
+
         self._train_metrics = {
             "train_auc": train_auc,
             "test_auc": test_auc,
@@ -192,8 +235,9 @@ class TradingModel:
             "test_samples": len(X_test),
             "num_features": len(available_features),
         }
-        
-        logger.info(f"Training complete: Train AUC={train_auc:.4f}, Test AUC={test_auc:.4f}")
+
+        test_auc_str = f"{test_auc:.4f}" if not np.isnan(test_auc) else "N/A (single class)"
+        logger.info(f"Training complete: Train AUC={train_auc:.4f}, Test AUC={test_auc_str}")
         
         # Auto-save if path provided
         if self.model_path:
@@ -471,11 +515,15 @@ class TradingModel:
             X_test = np.nan_to_num(X_test, nan=0.0)
             
             dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=available_features)
-            dtest = xgb.DMatrix(X_test, label=y_test, feature_names=available_features)
-            
+
             train_auc = self._evaluate(dtrain)
+
+            # Skip AUC for test folds with only one class (common in time-series windows)
+            if len(np.unique(y_test)) < 2:
+                continue
+
+            dtest = xgb.DMatrix(X_test, label=y_test, feature_names=available_features)
             test_auc = self._evaluate(dtest)
-            
             results.append((train_auc, test_auc))
         
         if results:

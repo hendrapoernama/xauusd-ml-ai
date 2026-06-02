@@ -66,5 +66,9 @@ graph TD
 | *Dynamic Confidence* | **Aktif** | *Threshold* adaptif per kondisi pasar |
 | *Auto Trainer* | **Aktif** | *Retrain* otomatis tiap 7 hari |
 | *News Agent* | **Nonaktif** | Dikomentari di `main_live.py` baris 64 |
-| Telegram | **Aktif** | Notifikasi *entry/exit* + ringkasan harian |
-| *Trade Logger* | **Aktif** | *Logging* ke PostgreSQL |
+| Telegram | **Aktif** | Notifikasi *entry/exit* + ringkasan harian (layout PNL baru) |
+| *Trade Logger* | **Aktif** | *Logging* ke PostgreSQL — **opsional** (`DB_ENABLED`), *fallback* CSV |
+| Konektor MT5 | **Aktif** | *Attach-to-active-session* + *symbol auto-resolution* (XAUUSD./XAUUSDm/GOLD) |
+| *Startup Warmup* | **Aktif** | Analisa `STARTUP_WARMUP_LOOPS` candle (≈45 mnt) sebelum *trading* |
+
+> **Revisi v0.2.8:** SMC = strategi utama; ML & *Bias* H1 = pendukung (tidak memblokir). `MAX_POSITIONS` *default* **1**, batas kerugian harian **3%**. *Trailing stop* berbasis USD progresif + *trajectory recovery override*. Lihat [FEATURES.md](../FEATURES.md).

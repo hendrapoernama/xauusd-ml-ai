@@ -32,8 +32,9 @@ python-dotenv>=1.0.1
 # Numerical Computing (for numpy-based SMC algorithms)
 numpy>=1.26.0
 
-# HTTP Client (for Telegram)
-aiohttp>=3.9.0
+# HTTP Clients
+aiohttp>=3.9.0       # For Telegram notifications
+httpx>=0.25.0        # For multi-provider AI APIs (Z.AI, DeepSeek, OpenRouter, OpenAI)
 
 # PostgreSQL Database
 psycopg2-binary>=2.9.9
@@ -48,3 +49,6 @@ pydantic>=2.6.0
 
 # Optional: Connection pooling
 # asyncpg>=0.29.0
+
+# Optional: For Anthropic Claude provider
+# anthropic>=0.25.0  # Only needed if using AI_PROVIDER=anthropic

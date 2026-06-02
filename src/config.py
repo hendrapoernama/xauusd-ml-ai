@@ -293,6 +293,9 @@ class TradingConfig:
         if os.getenv("MAX_POSITION_SIZE"):
             config.risk.max_lot_size = float(os.getenv("MAX_POSITION_SIZE"))
 
+        if os.getenv("MAX_POSITIONS"):
+            config.risk.max_positions = int(os.getenv("MAX_POSITIONS"))
+
         if os.getenv("MIN_LOT_SIZE"):
             config.risk.min_lot_size = float(os.getenv("MIN_LOT_SIZE"))
 

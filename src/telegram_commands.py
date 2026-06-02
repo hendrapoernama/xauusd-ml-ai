@@ -1,317 +1,522 @@
 """
-Telegram Command Handlers
-=========================
-Handles all Telegram bot commands separately from main_live.py.
+Telegram Bot Commands Module
+============================
+Command handlers untuk monitoring trading bot via Telegram.
 
 Commands:
-  /status     — Bot status & account overview
-  /market     — Current market analysis & signals
-  /risk       — Risk management state & settings
-  /positions  — Open positions detail
-  /pos        — Alias for /positions
-  /daily      — Daily trading summary
-  /filters    — Entry filter status
-  /help       — List all available commands
-
-Integration:
-    from src.telegram_commands import register_commands
-    register_commands(bot)  # bot = TradingBot instance
+- /balance — current balance, equity, drawdown
+- /positions — open positions dengan P/L
+- /status — bot status (mode, consecutive losses, etc)
+- /help — list all commands
 """
 
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from datetime import datetime, date
+from datetime import datetime
 from zoneinfo import ZoneInfo
+from typing import Optional, Any
 from loguru import logger
+import asyncio
 
 WIB = ZoneInfo("Asia/Jakarta")
 
 
-def _fmt_usd(value: float) -> str:
-    """Format USD value with sign."""
-    if value >= 0:
-        return f"+${value:.2f}"
-    return f"-${abs(value):.2f}"
-
-
-def _timestamp() -> str:
-    """Return formatted WIB timestamp."""
-    return datetime.now(WIB).strftime('%H:%M')
-
-
-def register_commands(bot):
+def create_balance_command(trading_bot) -> str:
     """
-    Register all Telegram commands on the bot instance.
-
-    Args:
-        bot: TradingBot instance (has .telegram, .mt5, .smart_risk, etc.)
+    Handler untuk /balance command.
+    Menampilkan: balance, equity, drawdown, daily P/L.
     """
-    tg = bot.telegram
-    build = tg._build_section
+    try:
+        # Get account info dari MT5 (using private method)
+        account_info = trading_bot.mt5._get_account_info()
+        if not account_info:
+            return "❌ Tidak bisa ambil account info dari MT5"
 
-    # ------------------------------------------------------------------
-    # /status — Bot status & account overview
-    # ------------------------------------------------------------------
-    async def cmd_status():
-        balance = bot.mt5.account_balance or 0
-        equity = bot.mt5.account_equity or 0
-        floating = equity - balance
-        session_status = bot.session_filter.get_status_report()
-        risk_rec = bot.smart_risk.get_trading_recommendation()
-        risk_state = bot.smart_risk.get_state()
-        uptime = (datetime.now() - bot._start_time).total_seconds() / 3600
-        avg_ms = (sum(bot._execution_times) / len(bot._execution_times) * 1000) if bot._execution_times else 0
-        wr = (bot._total_session_wins / bot._total_session_trades * 100) if bot._total_session_trades > 0 else 0
-        can_icon = "✅" if session_status.get("can_trade", False) else "⛔"
+        balance = account_info.get("balance", 0)
+        equity = account_info.get("equity", 0)
+        margin_used = account_info.get("margin", 0)  # key is "margin" not "margin_used"
+        margin_free = account_info.get("margin_free", 0)
 
-        items_acct = [
-            f"Bal: <code>${balance:,.2f}</code>",
-            f"Eq: <code>${equity:,.2f}</code>",
-            f"Float: <b>{_fmt_usd(floating)}</b>",
-        ]
-        items_session = [
-            f"Trades: <code>{bot._total_session_trades}</code> ({bot._total_session_wins}W) | WR: <code>{wr:.1f}%</code>",
-            f"P/L: <b>{_fmt_usd(bot._total_session_profit)}</b>",
-        ]
-        items_risk = [
-            f"Mode: <code>{risk_rec.get('mode', 'normal').upper()}</code>",
-            f"Daily Loss: <code>${risk_state.daily_loss:.2f}</code> | Streak: <code>{risk_state.consecutive_losses}L</code>",
-            f"Total Loss: <code>${bot.smart_risk._total_loss:.2f}</code>",
-        ]
-        items_bot = [
-            f"{can_icon} {session_status.get('current_session', 'Unknown')} | Vol: <code>{session_status.get('volatility', '?')}</code>",
-            f"Uptime: <code>{uptime:.1f}h</code> | Loops: <code>{bot._loop_count}</code> | Exec: <code>{avg_ms:.0f}ms</code>",
-        ]
+        # Calculate metrics
+        drawdown_usd = balance - equity
+        drawdown_pct = (drawdown_usd / balance * 100) if balance > 0 else 0
+        profit_factor = equity - balance  # Minus = loss
+        margin_pct = (margin_used / (margin_used + margin_free) * 100) if (margin_used + margin_free) > 0 else 0
 
-        return f"""🤖 <b>STATUS</b>
+        # Daily P/L (from smart_risk state — use get_state() method)
+        risk_state = trading_bot.smart_risk.get_state()
+        daily_loss = getattr(risk_state, 'daily_loss', 0)
+        daily_loss_pct = getattr(risk_state, 'daily_loss_percent', 0)
 
-{build("Account", items_acct)}
+        msg = f"""💰 <b>ACCOUNT BALANCE</b>
 
-{build("Session", items_session)}
+<b>Balance:</b> ${balance:,.2f}
+<b>Equity:</b> ${equity:,.2f}
+<b>Drawdown:</b> ${drawdown_usd:,.2f} ({drawdown_pct:.2f}%)
 
-{build("Risk", items_risk)}
+<b>Margin Used:</b> ${margin_used:,.2f} ({margin_pct:.1f}%)
+<b>Margin Free:</b> ${margin_free:,.2f}
 
-{build("Bot", items_bot)}
+<b>Today P/L:</b> ${-daily_loss:,.2f} ({-daily_loss_pct:.2f}%)
+<b>Max Daily Loss:</b> ${trading_bot.smart_risk.max_daily_loss_usd:,.2f}
 
-⏰ {_timestamp()} WIB""".strip()
+⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB
+"""
+        return msg.strip()
 
-    cmd_status._cmd_desc = "Bot status & account"
+    except Exception as e:
+        return f"❌ Error: {e}"
 
-    # ------------------------------------------------------------------
-    # /market — Current market analysis
-    # ------------------------------------------------------------------
-    async def cmd_market():
-        tick = bot.mt5.get_tick(bot.config.symbol)
-        price = tick.bid if tick else 0
-        spread = (tick.ask - tick.bid) if tick else 0
 
-        session_status = bot.session_filter.get_status_report()
-        h1_bias = getattr(bot, "_h1_bias_cache", "NEUTRAL")
-        regime = getattr(bot, "_last_regime", None)
-        regime_str = regime.value if regime else "unknown"
-        ml_signal = getattr(bot, "_last_ml_signal", "HOLD")
-        ml_conf = getattr(bot, "_last_ml_confidence", 0)
-        smc_signal = getattr(bot, "_last_raw_smc_signal", "")
-        smc_conf = getattr(bot, "_last_raw_smc_confidence", 0)
-        threshold = getattr(bot, "_last_dynamic_threshold", 0.55)
-        quality = getattr(bot, "_last_market_quality", "unknown")
-        score = getattr(bot, "_last_market_score", 0)
+def create_positions_command(trading_bot) -> str:
+    """
+    Handler untuk /positions command.
+    Menampilkan: list semua open positions + P/L + durasi.
+    """
+    try:
+        positions = trading_bot.mt5.get_open_positions(symbol=trading_bot.config.symbol)
 
-        try:
-            df = bot.mt5.get_market_data(bot.config.symbol, bot.config.execution_timeframe, 50)
-            atr = df["atr"].tail(1).item() if "atr" in df.columns else 0
-        except Exception:
-            atr = 0
-
-        sig_emoji = {"BUY": "🟢", "SELL": "🔴"}.get(ml_signal, "⚪")
-        can_icon = "✅ READY" if session_status.get("can_trade", False) else "⛔ WAIT"
-
-        items_price = [
-            f"<b>{bot.config.symbol}</b> <code>${price:.2f}</code>",
-            f"ATR: <code>{atr:.2f}</code> | Spread: <code>{spread:.1f}</code>",
-        ]
-        items_signal = [
-            f"{sig_emoji} ML: <code>{ml_signal}</code> {ml_conf:.0%} / thresh {threshold:.0%}",
-            f"SMC: <code>{smc_signal or 'NONE'}</code> ({smc_conf:.0%})",
-            f"Quality: <code>{quality.upper()}</code> (score:{score})",
-            f"H1 Bias: <code>{h1_bias}</code>",
-        ]
-        items_market = [
-            f"Regime: <code>{regime_str}</code> | Vol: <code>{session_status.get('volatility', '?')}</code>",
-            f"Session: <code>{session_status.get('current_session', 'Unknown')}</code>",
-            f"Status: {can_icon}",
-        ]
-
-        return f"""📊 <b>MARKET</b>
-
-{build("Price", items_price)}
-
-{build("AI Signal", items_signal)}
-
-{build("Market", items_market)}
-
-⏰ {_timestamp()} WIB""".strip()
-
-    cmd_market._cmd_desc = "Market analysis & signals"
-
-    # ------------------------------------------------------------------
-    # /risk — Risk management state
-    # ------------------------------------------------------------------
-    async def cmd_risk():
-        risk_state = bot.smart_risk.get_state()
-        risk_rec = bot.smart_risk.get_trading_recommendation()
-        balance = bot.mt5.account_balance or bot.config.capital
-        max_daily_usd = bot.smart_risk.max_daily_loss_usd
-        max_total_usd = balance * bot.smart_risk.max_total_loss_percent / 100
-
-        items_settings = [
-            f"Risk/Trade: <code>{bot.config.risk.risk_per_trade}%</code>",
-            f"Max Daily Loss: <code>{bot.config.risk.max_daily_loss}%</code> (${max_daily_usd:.2f})",
-            f"Max Total Loss: <code>{bot.smart_risk.max_total_loss_percent}%</code> (${max_total_usd:.2f})",
-            f"Max Lot: <code>{bot.smart_risk.max_lot_size}</code>",
-            f"Max Positions: <code>{bot.smart_risk.max_concurrent_positions}</code>",
-        ]
-        items_state = [
-            f"Mode: <code>{risk_rec.get('mode', 'normal').upper()}</code>",
-            f"Daily Loss: <code>${risk_state.daily_loss:.2f}</code> / <code>${max_daily_usd:.2f}</code>",
-            f"Daily Profit: <code>${risk_state.daily_profit:.2f}</code>",
-            f"Total Loss: <code>${bot.smart_risk._total_loss:.2f}</code>",
-            f"Streak: <code>{risk_state.consecutive_losses}L</code>",
-        ]
-        items_rec = [
-            f"Lot: <code>{risk_rec.get('recommended_lot', 0)}</code>",
-            f"Reason: <code>{risk_rec.get('reason', '')[:60]}</code>",
-        ]
-
-        return f"""🛡 <b>RISK</b>
-
-{build("Settings", items_settings)}
-
-{build("Current State", items_state)}
-
-{build("Recommendation", items_rec)}
-
-⏰ {_timestamp()} WIB""".strip()
-
-    cmd_risk._cmd_desc = "Risk management state"
-
-    # ------------------------------------------------------------------
-    # /positions — Open positions detail
-    # ------------------------------------------------------------------
-    async def cmd_positions():
-        positions = bot.mt5.get_open_positions(
-            symbol=bot.config.symbol,
-            magic=bot.config.magic_number,
-        )
         if positions is None or len(positions) == 0:
-            return f"📭 <b>POSITIONS</b>\n\n└ No open positions\n\n⏰ {_timestamp()} WIB"
+            return "✅ Tidak ada posisi terbuka"
 
-        pos_items = []
+        msg = """📊 <b>OPEN POSITIONS</b>\n"""
+
         total_profit = 0
         for row in positions.iter_rows(named=True):
-            ticket = row.get("ticket", 0)
-            direction = "BUY" if row.get("type", 0) == 0 else "SELL"
+            ticket = row.get("ticket")
+            symbol = row.get("symbol", trading_bot.config.symbol)
+            order_type = row.get("type", "?")
+            volume = row.get("volume", 0)
+            price_open = row.get("price_open", 0)
             profit = row.get("profit", 0)
+
+            # Get current price untuk pips
+            tick = trading_bot.mt5.get_tick(symbol)
+            if tick:
+                current_price = tick.bid if order_type == "SELL" else tick.ask
+                pips = abs(current_price - price_open) * 100
+                if profit < 0:
+                    pips = -pips
+            else:
+                pips = 0
+
+            # Color code
+            emoji = "🟢" if profit >= 0 else "🔴"
+            sign = "+" if profit >= 0 else ""
+
+            msg += f"{emoji} #{ticket} {order_type} {volume}L @ ${price_open:.2f} | {sign}${profit:.2f} ({sign}{pips:.1f}pips)\n"
             total_profit += profit
-            open_price = row.get("price_open", 0)
-            current = row.get("price_current", 0)
-            sl = row.get("sl", 0)
-            tp = row.get("tp", 0)
-            lot = row.get("volume", 0)
 
-            guard = bot.smart_risk._position_guards.get(ticket)
-            momentum = guard.momentum_score if guard else 0
+        # Summary
+        total_emoji = "🟢" if total_profit >= 0 else "🔴"
+        msg += f"\n{total_emoji} <b>Total P/L:</b> ${total_profit:,.2f}"
+        msg += f"\n⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB"
 
-            pos_items.append(f"#{ticket} {direction} <code>{lot}</code>")
-            pos_items.append(f"  Open: <code>{open_price:.2f}</code> -> Now: <code>{current:.2f}</code>")
-            pos_items.append(f"  SL: <code>{sl:.2f}</code> | TP: <code>{tp:.2f}</code>")
-            pos_items.append(f"  P/L: <b>{_fmt_usd(profit)}</b> | M: <code>{momentum:+.0f}</code>")
+        return msg.strip()
 
-        summary = [f"Total: <code>{len(positions)}</code> positions, <b>{_fmt_usd(total_profit)}</b>"]
+    except Exception as e:
+        return f"❌ Error: {e}"
 
-        return f"""📈 <b>POSITIONS</b>
 
-{build("Open", pos_items)}
+def create_status_command(trading_bot) -> str:
+    """
+    Handler untuk /status command.
+    Menampilkan: bot mode, consecutive losses, last trade, etc.
+    """
+    try:
+        # Use get_state() method for proper access
+        risk_state = trading_bot.smart_risk.get_state()
 
-{build("Summary", summary)}
+        # Bot status
+        # Attribute is 'mode' (TradingMode enum), get value safely
+        mode = getattr(risk_state, 'mode', None)
+        bot_mode = mode.value if mode else 'UNKNOWN'
+        consecutive_losses = getattr(risk_state, 'consecutive_losses', 0)
+        daily_loss = getattr(risk_state, 'daily_loss', 0)
 
-⏰ {_timestamp()} WIB""".strip()
+        # Last trade info (ensure timezone-aware for safe arithmetic)
+        last_trade_time = trading_bot._last_trade_time
+        if last_trade_time is None:
+            time_since_last = 0
+        else:
+            # Make sure datetime is timezone-aware
+            if last_trade_time.tzinfo is None:
+                last_trade_time = last_trade_time.replace(tzinfo=WIB)
+            time_since_last = (datetime.now(WIB) - last_trade_time).total_seconds() / 60
 
-    cmd_positions._cmd_desc = "Open positions detail"
+        # Open positions count
+        open_pos = trading_bot.mt5.get_open_positions(symbol=trading_bot.config.symbol)
+        open_count = len(open_pos) if open_pos is not None else 0
 
-    # ------------------------------------------------------------------
-    # /daily — Daily trading summary
-    # ------------------------------------------------------------------
-    async def cmd_daily():
-        balance = bot.mt5.account_balance or bot.config.capital
-        trades = bot._total_session_trades
-        wins = bot._total_session_wins
-        losses = trades - wins
-        wr = (wins / trades * 100) if trades > 0 else 0
-        day_change = ((balance - bot._daily_start_balance) / bot._daily_start_balance * 100) if bot._daily_start_balance > 0 else 0
-        day_str = f"+{day_change:.2f}%" if day_change >= 0 else f"{day_change:.2f}%"
+        # Get current market condition
+        current_price = trading_bot.mt5.get_tick(trading_bot.config.symbol)
+        price_str = f"${current_price.bid:.2f}" if current_price else "N/A"
 
-        items_balance = [
-            f"Start: <code>${bot._daily_start_balance:,.2f}</code>",
-            f"Now: <code>${balance:,.2f}</code> (<b>{day_str}</b>)",
-            f"P/L: <b>{_fmt_usd(bot._total_session_profit)}</b>",
-        ]
-        items_stats = [
-            f"Trades: <code>{trades}</code>",
-            f"Wins: <code>{wins}</code> | Losses: <code>{losses}</code>",
-            f"Win Rate: <code>{wr:.1f}%</code>",
-        ]
+        msg = f"""🤖 <b>BOT STATUS</b>
 
-        return f"""📋 <b>DAILY</b> {date.today().strftime('%Y-%m-%d')}
+<b>Trading Mode:</b> {bot_mode}
+<b>Warmup Done:</b> {'✅ Yes' if trading_bot._warmup_done else '⏳ Warming up...'}
 
-{build("Balance", items_balance)}
+<b>Consecutive Losses:</b> {consecutive_losses}
+<b>Daily Loss:</b> ${daily_loss:,.2f}
 
-{build("Stats", items_stats)}
+<b>Open Positions:</b> {open_count}
+<b>Last Trade:</b> {time_since_last:.0f} min ago
 
-⏰ {_timestamp()} WIB""".strip()
+<b>Current Price:</b> {price_str}
+<b>Loop Count:</b> {trading_bot._loop_count}
 
-    cmd_daily._cmd_desc = "Daily trading summary"
+⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB
+"""
+        return msg.strip()
 
-    # ------------------------------------------------------------------
-    # /filters — Entry filter status
-    # ------------------------------------------------------------------
-    async def cmd_filters():
-        filters = getattr(bot, "_last_filter_results", [])
-        if not filters:
-            return f"🔍 <b>FILTERS</b>\n\n└ No filter data yet (wait for next candle)\n\n⏰ {_timestamp()} WIB"
+    except Exception as e:
+        return f"❌ Error: {e}"
 
-        filter_items = []
-        for f in filters:
-            icon = "✅" if f.get("passed", True) else "❌"
-            filter_items.append(f"{icon} {f.get('name', '')}: <code>{f.get('detail', '')}</code>")
 
-        passed = sum(1 for f in filters if f.get("passed", True))
-        total = len(filters)
+def create_closeall_command(trading_bot, telegram_notifier) -> str:
+    """
+    Handler untuk /closeall command.
+    Close SEMUA open positions dengan market order.
+    DANGER: Tidak ada konfirmasi, langsung execute.
+    """
+    try:
+        mt5 = trading_bot.mt5
+        symbol = trading_bot.config.symbol
 
-        return f"""🔍 <b>FILTERS</b> ({passed}/{total} passed)
+        # Get semua open positions
+        positions = mt5.positions_get(symbol=symbol)
+        if not positions:
+            return "✅ Tidak ada posisi terbuka yang perlu ditutup."
 
-{build("Entry Filters", filter_items)}
+        closed_count = 0
+        failed_count = 0
+        failed_tickets = []
 
-⏰ {_timestamp()} WIB""".strip()
+        for position in positions:
+            ticket = position.ticket
+            position_type = position.type
+            volume = position.volume
 
-    cmd_filters._cmd_desc = "Entry filter status"
+            try:
+                # Determine order type untuk close: opposite dari current position
+                # type 0 = BUY, type 1 = SELL
+                order_type = 1 if position_type == 0 else 0  # Close BUY dengan SELL, vice versa
 
-    # ------------------------------------------------------------------
-    # Register all commands
-    # ------------------------------------------------------------------
-    tg.register_command("status", cmd_status)
-    tg.register_command("s", cmd_status)          # alias
-    tg.register_command("market", cmd_market)
-    tg.register_command("m", cmd_market)           # alias
-    tg.register_command("risk", cmd_risk)
-    tg.register_command("positions", cmd_positions)
-    tg.register_command("pos", cmd_positions)      # alias
-    tg.register_command("p", cmd_positions)        # alias
-    tg.register_command("daily", cmd_daily)
-    tg.register_command("d", cmd_daily)            # alias
-    tg.register_command("filters", cmd_filters)
-    tg.register_command("f", cmd_filters)          # alias
+                request = {
+                    "action": 3,  # TRADE_ACTION_DEAL
+                    "symbol": symbol,
+                    "volume": volume,
+                    "type": order_type,
+                    "position": ticket,
+                    "magic": 999999,  # Emergency close magic
+                    "comment": "Emergency closeall via /closeall command",
+                }
 
-    logger.info("Telegram commands registered: /status /market /risk /positions /daily /filters /help")
+                result = mt5.send_order(request)
+                if result and result.retcode == 10009:  # TRADE_RETCODE_DONE
+                    closed_count += 1
+                    logger.info(f"Position {ticket} closed successfully via /closeall")
+                else:
+                    failed_count += 1
+                    failed_tickets.append(ticket)
+                    logger.warning(f"Failed to close position {ticket}: {result}")
+
+            except Exception as e:
+                failed_count += 1
+                failed_tickets.append(ticket)
+                logger.error(f"Error closing position {ticket}: {e}")
+
+        # Kirim report ke Telegram
+        msg = f"""⚠️ <b>CLOSEALL EXECUTED</b>
+
+<b>Closed:</b> {closed_count} position(s)
+<b>Failed:</b> {failed_count} position(s)"""
+
+        if failed_tickets:
+            msg += f"\n<b>Failed Tickets:</b> {', '.join(map(str, failed_tickets))}"
+
+        msg += f"\n\n⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB"
+        return msg.strip()
+
+    except Exception as e:
+        logger.error(f"Error in /closeall: {e}")
+        return f"❌ Error: {e}"
+
+
+def create_terminate_command(trading_bot, telegram_notifier) -> str:
+    """
+    Handler untuk /terminate command.
+    Terminate bot program (exit main loop).
+    DANGER: Program akan stop, tidak bisa recover tanpa restart manual.
+    """
+    try:
+        # Log termination event
+        logger.warning("=" * 60)
+        logger.warning("TERMINATE COMMAND RECEIVED VIA TELEGRAM")
+        logger.warning("Bot program is shutting down...")
+        logger.warning("=" * 60)
+
+        # Send notification
+        msg = """🛑 <b>BOT TERMINATED</b>
+
+Perintah /terminate diterima.
+Program bot sedang shutdown...
+
+Untuk restart, jalankan kembali:
+<code>python main_live.py</code>
+
+⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB"""
+
+        # Set flag untuk exit bot (handled dalam main_live.py event loop)
+        # Trading bot harus check flag ini di main loop
+        if hasattr(trading_bot, '_terminate_requested'):
+            trading_bot._terminate_requested = True
+        else:
+            # Create attribute jika tidak ada
+            trading_bot._terminate_requested = True
+
+        return msg.strip()
+
+    except Exception as e:
+        logger.error(f"Error in /terminate: {e}")
+        return f"❌ Error: {e}"
+
+
+async def create_news_command(trading_bot) -> str:
+    """
+    Handler untuk /news command.
+    Tampilkan kondisi berita dan economic calendar hari ini.
+    """
+    try:
+        news_agent = trading_bot.news_agent
+        if not news_agent:
+            return """⚠️ <b>NEWS AGENT DISABLED</b>
+
+News Agent telah di-disable karena backtest menunjukkan:
+- Cost: API calls + AI analysis
+- Impact: Mengurangi profit (tidak profitable untuk trading decisions)
+
+💡 Alternatif:
+- Gunakan /recommend untuk macro sentiment analysis
+- Cek economic calendar manual di https://www.forexfactory.com
+
+Status Bot: Aman untuk trading berdasarkan ML/SMC signals saja.
+
+⏰ """ + datetime.now(WIB).strftime('%H:%M:%S') + " WIB"
+
+        # Analyze news conditions
+        analysis = news_agent.analyze()
+
+        # Map condition ke emoji
+        condition_emoji = {
+            "safe": "🟢",
+            "caution": "🟡",
+            "danger_news": "🔴",
+            "danger_sentiment": "⚠️",
+            "unknown": "❓",
+        }
+        emoji = condition_emoji.get(analysis.condition.value, "❓")
+
+        msg = f"""{emoji} <b>NEWS & ECONOMIC CALENDAR</b>
+
+<b>Market Condition:</b> {analysis.condition.value.upper()}
+<b>Can Trade:</b> {'✅ Yes' if analysis.can_trade else '❌ NO'}
+<b>Lot Multiplier:</b> {analysis.recommended_lot_multiplier:.1f}x
+
+<b>Reason:</b>
+{analysis.reason}"""
+
+        # Add upcoming events if any
+        if analysis.upcoming_events:
+            msg += "\n\n<b>Upcoming Events:</b>"
+            for event in analysis.upcoming_events[:3]:  # Show first 3 events
+                importance_emoji = "🔴" if event.importance == 3 else "🟡" if event.importance == 2 else "🟢"
+                event_time = event.time.strftime("%H:%M %Z") if event.time else "Unknown"
+                msg += f"\n{importance_emoji} {event.name} ({event.currency}) @ {event_time}"
+                if event.forecast is not None:
+                    msg += f"\n   Forecast: {event.forecast} | Prev: {event.previous}"
+
+        # Add sentiment if available
+        if analysis.sentiment:
+            sentiment_emoji = "📈" if analysis.sentiment.label == "BULLISH" else "📉" if analysis.sentiment.label == "BEARISH" else "➡️"
+            msg += f"\n\n<b>Sentiment:</b> {sentiment_emoji} {analysis.sentiment.label}"
+            msg += f"\nConfidence: {analysis.sentiment.confidence:.1%}"
+            if analysis.sentiment.keywords_found:
+                msg += f"\nKeywords: {', '.join(analysis.sentiment.keywords_found[:5])}"
+
+        msg += f"\n\n⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB"
+        return msg.strip()
+
+    except Exception as e:
+        logger.error(f"Error in /news: {e}")
+        return f"❌ Error: {e}"
+
+
+async def create_recommend_command(trading_bot) -> str:
+    """
+    Handler untuk /recommend command.
+    Generate trading recommendation dari AI Agent.
+    """
+    try:
+        ai_provider = trading_bot.ai_provider
+        if not ai_provider:
+            return "⚠️ AI provider tidak tersedia, gunakan analisis teknikal saja"
+
+        # Get current market data
+        mt5 = trading_bot.mt5
+        symbol = trading_bot.config.symbol
+        df = mt5.get_market_data(
+            symbol=symbol,
+            timeframe=trading_bot.config.execution_timeframe,
+            count=50,
+        )
+
+        if df is None or len(df) == 0:
+            return "❌ Tidak bisa ambil data market"
+
+        current_price = df["close"].tail(1).item()
+        atr = df["atr"].tail(1).item() if "atr" in df.columns else 0
+
+        # Get ML signal
+        ml_signal = getattr(trading_bot, '_last_ml_signal', 'UNKNOWN')
+        ml_confidence = getattr(trading_bot, '_last_ml_confidence', 0.0)
+
+        # Get SMC signal
+        smc_signal = getattr(trading_bot, '_last_raw_smc_signal', 'UNKNOWN')
+        smc_confidence = getattr(trading_bot, '_last_raw_smc_confidence', 0.0)
+
+        # Get regime
+        try:
+            regime_result = trading_bot.regime_detector.detect_regime(df)
+            regime = regime_result.get('regime', 'UNKNOWN') if regime_result else 'UNKNOWN'
+        except Exception as e:
+            regime = 'UNKNOWN'
+
+        # Get account info
+        account_info = mt5._get_account_info()
+        balance = account_info.get("balance", 0) if account_info else 0
+        equity = account_info.get("equity", 0) if account_info else 0
+        drawdown_pct = ((balance - equity) / balance * 100) if balance > 0 else 0
+
+        # Call AI provider untuk macro analysis
+        try:
+            macro_context = await asyncio.wait_for(
+                ai_provider.analyze_macro_context(),
+                timeout=5.0  # 5 second timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning("/recommend: AI analysis timeout, using fallback")
+            macro_context = ai_provider._fallback_neutral_context()
+        except Exception as e:
+            logger.warning(f"/recommend: AI analysis error: {e}, using fallback")
+            macro_context = ai_provider._fallback_neutral_context()
+
+        # Determine recommendation
+        sentiment_emoji = "📈" if macro_context.sentiment > 0.2 else "📉" if macro_context.sentiment < -0.2 else "➡️"
+        signal_emoji = "🟢" if ml_signal == "BUY" else "🔴" if ml_signal == "SELL" else "⚪"
+        regime_emoji = "📈" if regime == "TRENDING" else "↔️" if regime == "RANGING" else "⚠️"
+
+        # Build recommendation based on multiple signals
+        is_bullish = ml_signal == "BUY" or smc_signal == "BUY"
+        is_bearish = ml_signal == "SELL" or smc_signal == "SELL"
+
+        if is_bullish and macro_context.sentiment > 0:
+            recommendation = "🟢 STRONG BUY — Semua sinyal aligned bullish"
+            reason = "ML/SMC bullish + Macro bullish sentiment"
+        elif is_bullish and macro_context.sentiment <= 0:
+            recommendation = "🟡 BUY (caution) — Bullish teknikal tapi macro headwind"
+            reason = f"ML/SMC bullish tapi sentimen makro bearish ({macro_context.sentiment:.1f})"
+        elif is_bearish and macro_context.sentiment < 0:
+            recommendation = "🔴 STRONG SELL — Semua sinyal aligned bearish"
+            reason = "ML/SMC bearish + Macro bearish sentiment"
+        elif is_bearish and macro_context.sentiment >= 0:
+            recommendation = "🟡 SELL (caution) — Bearish teknikal tapi macro tailwind"
+            reason = f"ML/SMC bearish tapi sentimen makro bullish ({macro_context.sentiment:.1f})"
+        else:
+            recommendation = "⚪ NEUTRAL — Tunggu sinyal lebih jelas"
+            reason = "Tidak ada sinyal yang kuat dari ML/SMC"
+
+        # Build message
+        msg = f"""<b>TRADING RECOMMENDATION</b>
+
+{recommendation}
+
+<b>Technical Signals:</b>
+{signal_emoji} ML: {ml_signal} ({ml_confidence:.1%} confidence)
+{signal_emoji} SMC: {smc_signal} ({smc_confidence:.1%} confidence)
+{regime_emoji} Regime: {regime}
+
+<b>Macro Analysis:</b>
+{sentiment_emoji} Sentiment: {macro_context.sentiment:+.2f} (bullish/bearish)
+📊 Reasoning: {macro_context.reasoning[:80]}...
+
+<b>Current Market:</b>
+💰 Price: ${current_price:,.2f}
+📏 ATR: {atr:.2f} pips
+📉 Drawdown: {drawdown_pct:.1f}%
+
+<b>Analysis Summary:</b>
+{reason}
+
+⚠️ Disclaimer: AI recommendation informatif saja, bukan jaminan profit.
+Validasi dengan risk management rules sebelum entry.
+
+⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB"""
+
+        return msg.strip()
+
+    except Exception as e:
+        logger.error(f"Error in /recommend: {e}")
+        return f"❌ Error: {e}"
+
+
+def register_default_commands(trading_bot, telegram_notifier):
+    """
+    Register semua default commands ke TelegramNotifier.
+    Dipanggil dari main_live.py di __init__.
+    """
+    if not telegram_notifier or not telegram_notifier.enabled:
+        return
+
+    # /balance
+    async def balance_cmd():
+        return create_balance_command(trading_bot)
+    balance_cmd._cmd_desc = "Account balance, equity, drawdown"
+    telegram_notifier.register_command("balance", balance_cmd)
+
+    # /positions
+    async def positions_cmd():
+        return create_positions_command(trading_bot)
+    positions_cmd._cmd_desc = "List open positions dengan P/L"
+    telegram_notifier.register_command("positions", positions_cmd)
+
+    # /status
+    async def status_cmd():
+        return create_status_command(trading_bot)
+    status_cmd._cmd_desc = "Bot status, mode, consecutive losses"
+    telegram_notifier.register_command("status", status_cmd)
+
+    # /closeall — close semua posisi trading
+    async def closeall_cmd():
+        return create_closeall_command(trading_bot, telegram_notifier)
+    closeall_cmd._cmd_desc = "Close SEMUA open positions (DANGER!)"
+    telegram_notifier.register_command("closeall", closeall_cmd)
+
+    # /terminate — terminate bot program
+    async def terminate_cmd():
+        return create_terminate_command(trading_bot, telegram_notifier)
+    terminate_cmd._cmd_desc = "Terminate bot program (DANGER!)"
+    telegram_notifier.register_command("terminate", terminate_cmd)
+
+    # /news — get economic calendar & news conditions
+    async def news_cmd():
+        return await create_news_command(trading_bot)
+    news_cmd._cmd_desc = "Economic calendar & market news conditions"
+    telegram_notifier.register_command("news", news_cmd)
+
+    # /recommend — AI trading recommendation
+    async def recommend_cmd():
+        return await create_recommend_command(trading_bot)
+    recommend_cmd._cmd_desc = "AI trading recommendation (ML + SMC + Macro)"
+    telegram_notifier.register_command("recommend", recommend_cmd)
+
+    logger.info("Telegram commands registered: /balance, /positions, /status, /closeall, /terminate, /news, /recommend")

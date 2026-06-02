@@ -96,7 +96,7 @@ class MT5Connector:
     ):
         """
         Initialize MT5 connector.
-        
+
         Args:
             login: MT5 account login
             password: MT5 account password
@@ -114,12 +114,16 @@ class MT5Connector:
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 5
         self._last_reconnect_time: Optional[datetime] = None
+        self._symbol_cache: Dict[str, str] = {}  # Maps requested symbol → actual broker symbol
         
     def connect(self, max_retries: int = 3) -> bool:
         """
-        Connect to MT5 terminal with retry logic.
+        Connect to MT5 terminal.
 
-        IMPROVED: Properly handles existing connections and ensures clean startup.
+        Strategy:
+        1. Coba attach ke terminal yang sudah aktif (tanpa login ulang).
+        2. Jika akun yang aktif sudah sesuai → langsung pakai.
+        3. Jika gagal atau akun tidak sesuai → fallback ke login penuh.
 
         Args:
             max_retries: Maximum connection attempts
@@ -131,16 +135,55 @@ class MT5Connector:
             logger.warning("MT5 not available - simulation mode")
             return False
 
+        # ── STEP 1: Coba attach ke terminal yang sudah berjalan ──────
+        # Jika MT5 sudah terbuka dan login, langsung pakai tanpa login ulang.
+        # Tidak perlu cocokkan login number — pakai akun apapun yang aktif.
+        try:
+            attach_kwargs = {"timeout": self.timeout}
+            if self.path:
+                attach_kwargs["path"] = self.path
+
+            if mt5.initialize(**attach_kwargs):
+                time.sleep(1)
+                info = mt5.account_info()
+                terminal_info = mt5.terminal_info()
+
+                if (info is not None
+                        and terminal_info is not None
+                        and terminal_info.connected):
+                    # Terminal aktif dan connected — langsung pakai akun yang sedang login
+                    self._connected = True
+                    self.login = info.login          # Sync login ke akun aktif
+                    self._account_info = self._get_account_info()
+                    self._symbol_cache.clear()
+                    logger.info(
+                        f"MT5 terhubung ke sesi aktif — "
+                        f"Account: {info.login} | Server: {info.server} | "
+                        f"Balance: ${info.balance:,.2f}"
+                    )
+                    return True
+
+                # Terminal ada tapi belum connected — shutdown dan coba login penuh
+                mt5.shutdown()
+                time.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"Attach attempt failed: {e}")
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        # ── STEP 2: Login penuh dengan kredensial ────────────────────
+        logger.info("Menghubungkan ke MT5 dengan kredensial...")
         for attempt in range(max_retries):
             try:
-                # IMPORTANT: Shutdown any existing connection first
                 try:
                     mt5.shutdown()
-                    time.sleep(0.5)  # Brief pause after shutdown
+                    time.sleep(0.5)
                 except Exception:
                     pass
 
-                # Build initialization kwargs
                 kwargs = {
                     "login": self.login,
                     "password": self._password,
@@ -151,35 +194,27 @@ class MT5Connector:
                     kwargs["path"] = self.path
 
                 if mt5.initialize(**kwargs):
-                    # Wait for terminal to fully initialize
-                    time.sleep(2)  # Increased delay for stability
+                    time.sleep(2)
 
-                    # Verify connection by getting terminal info
                     terminal_info = mt5.terminal_info()
                     if terminal_info is None:
-                        logger.warning("Terminal info not available, retrying...")
+                        logger.warning("Terminal info tidak tersedia, mencoba ulang...")
                         mt5.shutdown()
                         time.sleep(2)
                         continue
 
-                    # Check if terminal is connected to trade server
                     if not terminal_info.connected:
-                        logger.warning("Terminal not connected to trade server, waiting...")
+                        logger.warning("Terminal belum terhubung ke trade server, menunggu...")
                         time.sleep(3)
                         terminal_info = mt5.terminal_info()
                         if not terminal_info or not terminal_info.connected:
-                            logger.warning("Still not connected, retrying...")
                             mt5.shutdown()
                             continue
 
                     self._connected = True
                     self._account_info = self._get_account_info()
+                    self._symbol_cache.clear()
                     logger.info(f"Connected to MT5: {self.server} (Account: {self.login})")
-
-                    # Pre-select common symbols to ensure they're ready
-                    mt5.symbol_select("XAUUSD", True)
-                    time.sleep(0.5)
-
                     return True
 
                 error = mt5.last_error()
@@ -188,7 +223,6 @@ class MT5Connector:
             except Exception as e:
                 logger.error(f"Connection error: {e}")
 
-            # Exponential backoff with longer delays
             wait_time = 2 ** (attempt + 1)
             logger.info(f"Waiting {wait_time}s before retry...")
             time.sleep(wait_time)
@@ -309,6 +343,86 @@ class MT5Connector:
             "currency": info.currency,
         }
     
+    def resolve_symbol(self, symbol: str) -> str:
+        """
+        Resolve the actual symbol name used by the connected broker.
+
+        Different brokers suffix gold differently: XAUUSD, XAUUSD., XAUUSDm,
+        XAUUSDx, GOLD, XAU/USD, etc. This method tries the given symbol first,
+        then searches the broker's symbol list for the closest match, and caches
+        the result so subsequent calls are instant.
+
+        Args:
+            symbol: Requested symbol (e.g. "XAUUSD")
+
+        Returns:
+            Actual broker symbol name (e.g. "XAUUSD." or "XAUUSDm")
+        """
+        if not mt5:
+            return symbol
+
+        # Return cached result if available
+        if symbol in self._symbol_cache:
+            return self._symbol_cache[symbol]
+
+        # Try the symbol exactly as given
+        if mt5.symbol_select(symbol, True):
+            info = mt5.symbol_info(symbol)
+            if info is not None:
+                self._symbol_cache[symbol] = symbol
+                return symbol
+
+        logger.info(f"Symbol '{symbol}' not found directly — searching broker symbol list...")
+
+        # Fetch all symbols from the broker
+        all_symbols = mt5.symbols_get()
+        if not all_symbols:
+            logger.warning("Could not retrieve symbol list from MT5")
+            return symbol
+
+        # Normalise: strip common punctuation for comparison
+        def _norm(s: str) -> str:
+            return s.upper().replace(".", "").replace("-", "").replace("/", "").replace("+", "").replace("_", "")
+
+        base_norm = _norm(symbol)
+        base_core = base_norm[:6]  # e.g. "XAUUSD" from "XAUUSD" or "XAUUSD+"
+
+        # Collect candidates — exact normalised match wins; partial match is fallback
+        exact_candidates: List[str] = []
+        partial_candidates: List[str] = []
+
+        for s in all_symbols:
+            n = _norm(s.name)
+            if n == base_norm:
+                exact_candidates.append(s.name)
+            elif base_core in n or n.startswith(base_core):
+                partial_candidates.append(s.name)
+
+        # Log what we found for transparency
+        gold_related = [
+            s.name for s in all_symbols
+            if "XAU" in s.name.upper() or "GOLD" in s.name.upper()
+        ]
+        if gold_related:
+            logger.info(f"Gold-related symbols on this broker: {gold_related}")
+
+        for candidate in (exact_candidates + partial_candidates):
+            if mt5.symbol_select(candidate, True):
+                info = mt5.symbol_info(candidate)
+                if info is not None:
+                    logger.info(f"Symbol resolved: '{symbol}' → '{candidate}'")
+                    # Cache under the original name AND the resolved name
+                    self._symbol_cache[symbol] = candidate
+                    self._symbol_cache[candidate] = candidate
+                    return candidate
+
+        logger.warning(
+            f"Could not resolve symbol '{symbol}' on broker '{self.server}'. "
+            f"Gold-related symbols available: {gold_related}. "
+            f"Set SYMBOL=<correct_name> in .env to fix this."
+        )
+        return symbol  # Fallback — let the caller handle the error
+
     @property
     def account_balance(self) -> float:
         """Get current account balance."""
@@ -361,6 +475,9 @@ class MT5Connector:
 
         rates = None
 
+        # Resolve the actual broker symbol name (cached after first call)
+        resolved_symbol = self.resolve_symbol(symbol)
+
         for attempt in range(max_retries):
             # Auto-reconnect if disconnected
             if not self.ensure_connected():
@@ -369,21 +486,21 @@ class MT5Connector:
                 continue
 
             # Ensure symbol is selected in Market Watch
-            select_result = mt5.symbol_select(symbol, True)
+            select_result = mt5.symbol_select(resolved_symbol, True)
             if not select_result:
                 error = mt5.last_error()
-                logger.warning(f"Failed to select symbol {symbol}, attempt {attempt + 1}: {error}")
+                logger.warning(f"Failed to select symbol {resolved_symbol}, attempt {attempt + 1}: {error}")
 
-                # Check if symbol exists at all
-                symbol_info = mt5.symbol_info(symbol)
-                if symbol_info is None:
-                    logger.warning(f"Symbol {symbol} not found in MT5 - check if symbol name is correct")
+                # Clear symbol cache and re-resolve after reconnect
+                self._symbol_cache.pop(symbol, None)
+                self._symbol_cache.pop(resolved_symbol, None)
 
                 # Symbol select failure often indicates connection issue - force reconnect
                 self._connected = False
-                if attempt >= 1:  # After 2 failed attempts, do full reconnect
+                if attempt >= 1:
                     logger.info("Symbol select failing repeatedly, forcing full reconnect...")
                     self.reconnect()
+                    resolved_symbol = self.resolve_symbol(symbol)  # Re-resolve after reconnect
                 else:
                     time.sleep(1)
                 continue
@@ -392,7 +509,7 @@ class MT5Connector:
             time.sleep(0.2)
 
             # Fetch rates from MT5
-            rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+            rates = mt5.copy_rates_from_pos(resolved_symbol, tf, 0, count)
 
             if rates is not None and len(rates) > 0:
                 # Success!
@@ -417,7 +534,7 @@ class MT5Connector:
 
         # Final check
         if rates is None or len(rates) == 0:
-            logger.error(f"Failed to get market data for {symbol} after {max_retries} attempts")
+            logger.error(f"Failed to get market data for {resolved_symbol} after {max_retries} attempts")
             return self._create_empty_dataframe()
         
         # CRITICAL: Convert numpy structured array directly to Polars
@@ -446,7 +563,7 @@ class MT5Connector:
             pl.col("tick_volume").cast(pl.Int64).alias("volume"),
         ]).drop("tick_volume")
         
-        logger.debug(f"Fetched {len(df)} bars for {symbol} {timeframe}")
+        logger.debug(f"Fetched {len(df)} bars for {resolved_symbol} {timeframe}")
         return df
     
     def get_multi_timeframe_data(
@@ -471,31 +588,40 @@ class MT5Connector:
             data[tf] = self.get_market_data(symbol, tf, count)
         return data
     
-    def get_tick(self, symbol: str) -> Optional[TickData]:
+    def get_tick(self, symbol: str, max_retries: int = 3) -> Optional[TickData]:
         """
-        Get current tick data for symbol.
-        
+        Get current tick data for symbol with retry logic.
+
         Args:
             symbol: Trading symbol
-            
+            max_retries: Retry attempts if tick is None
+
         Returns:
             TickData object or None
         """
         if not mt5:
             return None
-            
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
-            return None
-        
-        return TickData(
-            time=datetime.fromtimestamp(tick.time),
-            bid=tick.bid,
-            ask=tick.ask,
-            last=tick.last,
-            volume=tick.volume,
-            spread=(tick.ask - tick.bid),
-        )
+
+        resolved = self.resolve_symbol(symbol)
+
+        for attempt in range(max_retries):
+            tick = mt5.symbol_info_tick(resolved)
+            if tick is not None:
+                return TickData(
+                    time=datetime.fromtimestamp(tick.time),
+                    bid=tick.bid,
+                    ask=tick.ask,
+                    last=tick.last,
+                    volume=tick.volume,
+                    spread=(tick.ask - tick.bid),
+                )
+            if attempt < max_retries - 1:
+                # Ensure symbol is selected and wait briefly before retry
+                mt5.symbol_select(resolved, True)
+                time.sleep(0.3)
+
+        logger.warning(f"get_tick: could not get tick for '{resolved}' after {max_retries} attempts")
+        return None
     
     def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get symbol information."""
@@ -552,12 +678,24 @@ class MT5Connector:
         """
         if not mt5:
             return OrderResult(success=False, comment="MT5 not available")
-        
-        # Get current prices
-        tick = mt5.symbol_info_tick(symbol)
+
+        # Resolve actual broker symbol name
+        resolved_symbol = self.resolve_symbol(symbol)
+
+        # Get current prices — retry up to 3× (tick can be momentarily unavailable)
+        tick = None
+        for _t in range(3):
+            tick = mt5.symbol_info_tick(resolved_symbol)
+            if tick is not None:
+                break
+            mt5.symbol_select(resolved_symbol, True)
+            time.sleep(0.3)
+
         if tick is None:
-            return OrderResult(success=False, comment="Failed to get tick data")
-        
+            error = mt5.last_error()
+            logger.error(f"send_order: cannot get tick for '{resolved_symbol}': {error}")
+            return OrderResult(success=False, comment=f"Failed to get tick data: {error}")
+
         # Determine order type and price
         if order_type.upper() == "BUY":
             mt5_type = mt5.ORDER_TYPE_BUY
@@ -569,7 +707,7 @@ class MT5Connector:
         # Build request
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
+            "symbol": resolved_symbol,
             "volume": float(volume),
             "type": mt5_type,
             "price": float(order_price),
@@ -754,10 +892,11 @@ class MT5Connector:
         """
         if not mt5:
             return pl.DataFrame()
-        
-        # Get positions
+
+        # Resolve actual broker symbol name before querying
         if symbol:
-            positions = mt5.positions_get(symbol=symbol)
+            resolved = self.resolve_symbol(symbol)
+            positions = mt5.positions_get(symbol=resolved)
         else:
             positions = mt5.positions_get()
         
@@ -795,6 +934,104 @@ class MT5Connector:
         
         return df
     
+    def get_closed_deals(
+        self,
+        ticket: Optional[int] = None,
+        from_time: Optional[datetime] = None,
+        to_time: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get closed deals (trade history) from MT5.
+
+        Used to detect broker-closed positions (SL hit, TP hit, manual close)
+        and identify their exit reasons.
+
+        Args:
+            ticket: Specific deal ticket to query, or None for all recent deals
+            from_time: Start time for history query (default: 24h ago)
+            to_time: End time for history query (default: now)
+
+        Returns:
+            List of deal dicts with fields:
+            - ticket: deal ticket number
+            - position_id: position ticket this deal closed
+            - type: 'BUY', 'SELL', 'BUY_CLOSING', 'SELL_CLOSING'
+            - entry_price: open price
+            - exit_price: close price (if closing deal)
+            - profit: P/L
+            - time: deal timestamp
+            - symbol: symbol
+            - comment: deal comment (may contain close reason)
+        """
+        if not mt5:
+            return []
+
+        # Default: last 24 hours
+        if from_time is None:
+            from_time = datetime.now() - __import__('datetime').timedelta(days=1)
+        if to_time is None:
+            to_time = datetime.now()
+
+        try:
+            # Query history deals in time range
+            deals = mt5.history_deals_get(from_time, to_time)
+            if not deals:
+                return []
+
+            result = []
+            for deal in deals:
+                # Filter by ticket if specified
+                if ticket is not None and deal.ticket != ticket:
+                    continue
+
+                deal_dict = {
+                    "ticket": deal.ticket,
+                    "position_id": deal.position_id,
+                    "type": self._get_deal_type_name(deal.type),
+                    "entry_price": deal.entry_price if hasattr(deal, 'entry_price') else deal.price,
+                    "price": deal.price,  # Actual close price
+                    "profit": deal.profit,
+                    "time": datetime.fromtimestamp(deal.time),
+                    "symbol": deal.symbol,
+                    "comment": deal.comment if hasattr(deal, 'comment') else "",
+                    "deal_type": deal.type,  # Raw enum untuk debug
+                }
+                result.append(deal_dict)
+
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to get closed deals: {e}")
+            return []
+
+    def _get_deal_type_name(self, deal_type: int) -> str:
+        """Convert MT5 deal type enum to readable name."""
+        if not mt5:
+            return "UNKNOWN"
+
+        type_map = {
+            mt5.DEAL_TYPE_BUY: "BUY",
+            mt5.DEAL_TYPE_SELL: "SELL",
+            mt5.DEAL_TYPE_BUY_CANCEL: "BUY_CANCEL",
+            mt5.DEAL_TYPE_SELL_CANCEL: "SELL_CANCEL",
+            mt5.DEAL_TYPE_BALANCE: "BALANCE",
+            mt5.DEAL_TYPE_CREDIT: "CREDIT",
+            mt5.DEAL_TYPE_CHARGE: "CHARGE",
+            mt5.DEAL_TYPE_CORRECTION: "CORRECTION",
+            mt5.DEAL_TYPE_BONUS: "BONUS",
+            mt5.DEAL_TYPE_COMMISSION: "COMMISSION",
+            mt5.DEAL_TYPE_COMMISSION_DAILY: "COMMISSION_DAILY",
+            mt5.DEAL_TYPE_COMMISSION_MONTHLY: "COMMISSION_MONTHLY",
+            mt5.DEAL_TYPE_COMMISSION_AGENT_DAILY: "COMMISSION_AGENT_DAILY",
+            mt5.DEAL_TYPE_COMMISSION_AGENT_MONTHLY: "COMMISSION_AGENT_MONTHLY",
+            mt5.DEAL_TYPE_INTEREST: "INTEREST",
+            mt5.DEAL_TYPE_BUY_CLOSING: "BUY_CLOSING",
+            mt5.DEAL_TYPE_SELL_CLOSING: "SELL_CLOSING",
+            mt5.DEAL_TYPE_DIVIDEND: "DIVIDEND",
+            mt5.DEAL_TYPE_DIVIDEND_FRANKED: "DIVIDEND_FRANKED",
+            mt5.DEAL_TYPE_TAX: "TAX",
+        }
+        return type_map.get(deal_type, f"UNKNOWN({deal_type})")
+
     def _create_empty_dataframe(self) -> pl.DataFrame:
         """Create empty DataFrame with correct schema."""
         return pl.DataFrame({

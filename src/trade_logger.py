@@ -192,7 +192,7 @@ class TradeLogger:
     Thread-safe for concurrent access.
     """
 
-    def __init__(self, data_dir: str = "data/trade_logs", use_db: bool = True):
+    def __init__(self, data_dir: str = "data/trade_logs", use_db: Optional[bool] = None):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -217,6 +217,17 @@ class TradeLogger:
         self._csv_writes = 0
 
         # Database setup
+        # Auto-detect: disable DB if no DB_ credentials in env and caller didn't force it on
+        if use_db is None:
+            db_configured = bool(os.getenv("DB_HOST") or os.getenv("DB_PASSWORD"))
+            db_enabled_flag = os.getenv("DB_ENABLED", "auto").lower()
+            if db_enabled_flag == "false":
+                use_db = False
+            elif db_enabled_flag == "true":
+                use_db = True
+            else:  # "auto"
+                use_db = db_configured
+
         self._use_db = use_db and DB_AVAILABLE
         self._db_connected = False
         self._db = None
