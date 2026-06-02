@@ -171,16 +171,47 @@ class TradingModelV2:
         """
         # Validate features
         available_features = [f for f in feature_cols if f in df.columns]
+
+        # Exclude training-only features that won't be available during live prediction
+        training_only = {"target_return", "target", "multi_bar_target"}
+        available_features = [f for f in available_features if f not in training_only]
+
         if len(available_features) < len(feature_cols):
             missing = set(feature_cols) - set(available_features)
-            logger.warning(f"Missing features (will be skipped): {missing}")
+            logger.warning(f"Missing/excluded features (will be skipped): {missing}")
 
         if target_col not in df.columns:
             logger.error(f"Target column '{target_col}' not found")
             return self
 
-        # Drop nulls
-        df_clean = df.select(available_features + [target_col]).drop_nulls()
+        # Only require TARGET to be non-null — fill feature NaNs with 0
+        # (drop_nulls on all columns causes massive data loss when V2/SMC features have sparse nulls)
+        df_work = df.select(available_features + [target_col])
+        df_work = df_work.filter(pl.col(target_col).is_not_null())
+
+        # Log and drop feature columns with >80% null (useless for training)
+        bad_cols = []
+        for col in available_features:
+            null_rate = df_work[col].null_count() / max(len(df_work), 1)
+            if null_rate > 0.80:
+                bad_cols.append(col)
+        if bad_cols:
+            logger.warning(f"Dropping {len(bad_cols)} features with >80% null: {bad_cols[:5]}{'...' if len(bad_cols) > 5 else ''}")
+            available_features = [f for f in available_features if f not in bad_cols]
+
+        # Fill remaining feature nulls with 0 (nan_to_num handles the rest after numpy conversion)
+        float_cols = [f for f in available_features if df_work[f].dtype in (pl.Float64, pl.Float32)]
+        int_cols   = [f for f in available_features if df_work[f].dtype in (pl.Int64, pl.Int32, pl.Int8)]
+        fill_exprs = (
+            [pl.col(c).fill_nan(0.0).fill_null(0.0) for c in float_cols] +
+            [pl.col(c).fill_null(0) for c in int_cols]
+        )
+        if fill_exprs:
+            df_work = df_work.with_columns(fill_exprs)
+
+        df_clean = df_work.select(available_features + [target_col])
+
+        logger.info(f"Training data: {len(df_clean)} samples, {len(available_features)} features (after null handling)")
 
         if len(df_clean) < 100:
             logger.warning(f"Insufficient data for training: {len(df_clean)} samples")
@@ -192,7 +223,7 @@ class TradingModelV2:
         X = df_clean.select(available_features).to_numpy()
         y = df_clean.select(target_col).to_numpy().ravel()
 
-        # Handle NaN/inf
+        # Handle any remaining NaN/inf
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Train/test split with gap (prevent temporal leakage)
@@ -359,6 +390,14 @@ class TradingModelV2:
 
         features = feature_cols or self.feature_names
         latest = df.tail(1)
+
+        # Filter out training-only features (target_return, target) that don't exist in live data
+        available_cols = set(latest.columns)
+        features = [f for f in features if f in available_cols]
+
+        if not features:
+            logger.error("No valid features available for prediction")
+            return PredictionResultV2(signal="HOLD", probability=0.5, confidence=0.0)
 
         # Extract features
         try:

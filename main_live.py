@@ -69,6 +69,8 @@ from src.dynamic_confidence import DynamicConfidenceManager, create_dynamic_conf
 # from src.news_agent import NewsAgent, create_news_agent, MarketCondition  # DISABLED
 from src.trade_logger import TradeLogger, get_trade_logger
 from src.filter_config import FilterConfigManager
+from src.ai_provider import AIProvider, init_ai_provider, get_ai_provider
+from src.telegram_commands import register_default_commands
 
 
 class TradingBot:
@@ -152,6 +154,9 @@ class TradingBot:
             atr_trail_step_mult=2.0,   # v4: Trail step 2x ATR (from 1.5)
             min_profit_to_protect=8.0, # v4: Regime/signal exit only at $8+ (from $3)
             max_drawdown_from_peak=40.0,  # v4: Allow 40% drawdown (from 25%)
+            # Dollar-based trailing stop (configurable via .env)
+            trail_start_usd=float(os.getenv("TRAIL_START_USD", "3.0")),
+            trail_distance_pips=float(os.getenv("TRAIL_DISTANCE_PIPS", "15.0")),
             # Smart Market Close Handler
             enable_market_close_handler=True,
             min_profit_before_close=3.0,   # v4: from $2
@@ -180,6 +185,13 @@ class TradingBot:
         # ML model already handles volatility well
         self.news_agent = None
 
+        # Initialize AI Provider (LLM for enrichment, Fase 1: zero-risk Telegram enrichment)
+        self.ai_provider: Optional[AIProvider] = init_ai_provider()
+        if self.ai_provider and self.ai_provider.enabled:
+            logger.info(f"AI Provider initialized: {self.ai_provider.model} (Fase 1: enrichment-only)")
+        else:
+            logger.info("AI Provider disabled — Telegram notifications will not have macro enrichment")
+
         # Initialize Trade Logger - for ML auto-training
         self.trade_logger = get_trade_logger()
 
@@ -198,7 +210,12 @@ class TradingBot:
         self._execution_times: list = []
         self._current_date = date.today()
         self._models_loaded = False
-        self._trade_cooldown_seconds = 150  # OPTIMIZED: 2.5 min (~10 bars on M15) - was 300
+        # Trade cooldown — read from env (flexible), default 150 sec (2.5 min)
+        self._trade_cooldown_seconds = int(os.getenv("TRADE_COOLDOWN_SECONDS", "150"))
+        # Startup warmup — counter ini SELALU mulai dari 0, tidak pernah di-restore dari state
+        self._startup_warmup_loops = int(os.getenv("STARTUP_WARMUP_LOOPS", "3"))
+        self._startup_candles = 0   # Candle counter sejak bot start (bukan _loop_count yg di-restore)
+        self._warmup_done = False
         self._start_time = datetime.now()
         self._daily_start_balance: float = 0
         self._total_session_profit: float = 0
@@ -214,6 +231,9 @@ class TradingBot:
         self._pyramid_done_tickets: set = set()  # Tickets that already triggered a pyramid
         self._last_pyramid_time: Optional[datetime] = None  # Cooldown between pyramids
         self._position_check_interval: int = 5  # Check positions every N seconds between candles (more data points for velocity)
+
+        # [Lapis 3] SL Analysis confidence modifier (from AI analysis)
+        self._sl_confidence_modifier: float = 0.0  # Modifier from last SL analysis (if SL_ANALYSIS_IMPACT_ENABLED)
 
         # Entry filter tracking for dashboard
         self._last_filter_results: list = []
@@ -232,6 +252,12 @@ class TradingBot:
 
         # Restore dashboard state from previous session
         self._restore_dashboard_state()
+
+        # Register Telegram bot commands (/balance, /positions, /status, /closeall, /terminate)
+        register_default_commands(self, self.telegram)
+
+        # Flag untuk handle /terminate command via Telegram
+        self._terminate_requested: bool = False
 
     def _restore_dashboard_state(self):
         """Restore dashboard histories from bot_status.json so restart doesn't lose data."""
@@ -847,9 +873,6 @@ class TradingBot:
             if not self.simulation:
                 return
 
-        # Register Telegram commands
-        self._register_telegram_commands()
-
         # Sync position guards with MT5 (cleanup stale guards from previous restarts)
         self._sync_position_guards()
 
@@ -1106,16 +1129,11 @@ class TradingBot:
         """
         return self.filter_config.is_enabled(filter_key)
 
-    def _register_telegram_commands(self):
-        """Register Telegram command handlers from separate module."""
-        from src.telegram_commands import register_commands
-        register_commands(self)
-
     async def _main_loop(self):
         """Main trading loop - CANDLE-BASED (not time-based)."""
         last_position_check = time.time()
 
-        while self._running:
+        while self._running and not self._terminate_requested:
             loop_start = time.perf_counter()
 
             try:
@@ -1152,6 +1170,7 @@ class TradingBot:
                 if is_new_candle:
                     # NEW CANDLE: Run full analysis
                     self._last_candle_time = current_candle_time
+                    self._startup_candles += 1   # Selalu mulai dari 1 setiap run baru
                     await self._trading_iteration()
                     self._loop_count += 1
 
@@ -1567,6 +1586,21 @@ class TradingBot:
                     current_price=current_price,
                 )
 
+                # [Lapis 1 SL Learning Loop] Detect broker-closed positions (SL/TP hit by broker)
+                # Run every N iterations to detect hard SL that bot doesn't actively manage
+                if self._loop_count % 10 == 0:  # Every ~10 seconds (10 iterations × 1s)
+                    await self._detect_broker_closed_positions()
+
+        # [Telegram Commands] Poll for user commands (/balance, /positions, /status)
+        # Run setiap ~3 detik untuk responsif tapi tidak overwhelming
+        if self._loop_count % 3 == 0 and self.telegram and self.telegram.enabled:
+            try:
+                cmd_count = await self.telegram.poll_commands()
+                if cmd_count > 0:
+                    logger.debug(f"Processed {cmd_count} Telegram command(s)")
+            except Exception as e:
+                logger.debug(f"Command polling error: {e}")
+
             # Log position summary periodically
             if self._loop_count % 60 == 0:
                 total_profit = 0
@@ -1591,7 +1625,66 @@ class TradingBot:
             current_price=current_price,
         )
         
-        # 7. Check regime allows trading
+        # ── 6. STARTUP WARMUP ────────────────────────────────────────────────────
+        # Pakai _startup_candles (bukan _loop_count) agar selalu mulai dari 0
+        # meskipun bot di-restart dan _loop_count di-restore dari state.
+        if not self._warmup_done:
+            if self._startup_candles < self._startup_warmup_loops:
+                remaining = self._startup_warmup_loops - self._startup_candles
+                logger.info(
+                    f"[WARMUP {self._startup_candles}/{self._startup_warmup_loops}] "
+                    f"Analisa pasar berjalan — trading dimulai setelah {remaining} candle lagi "
+                    f"| Regime: {regime_state.regime.value if regime_state else 'N/A'} "
+                    f"| SMC: {smc_signal.signal_type if smc_signal else 'NONE'} "
+                    f"| ML: {ml_prediction.signal}({ml_prediction.confidence:.0%})"
+                )
+                return   # Analisa jalan, tapi TIDAK ada trading
+            self._warmup_done = True
+            logger.info(
+                f"[WARMUP SELESAI] {self._startup_warmup_loops} candle dianalisa "
+                f"— bot SIAP trading!"
+            )
+
+        # ── 6.3 WEEKEND TRADING BLOCK (Hard stop) ────────────────────────────
+        # NO TRADING Saturday-Sunday (WIB) — market has thin liquidity & gaps
+        # Saturday 00:00 WIB (Friday 17:00 EST) through Sunday 23:59 WIB
+        # v0.2.8 fix: Prevent losses from weekend trading noise
+        now_wib = datetime.now(ZoneInfo("Asia/Jakarta"))
+        weekday = now_wib.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+
+        if weekday >= 5:  # Saturday (5) or Sunday (6)
+            self._last_filter_results.append({
+                "name": "Weekend Trading Block",
+                "passed": False,
+                "detail": f"Weekend ({now_wib.strftime('%A %H:%M')} WIB) — no trading",
+            })
+            logger.info(f"[WEEKEND BLOCK] No trading on {now_wib.strftime('%A')} — market closed for XAUUSD")
+            return
+
+        # ── 6.5 POSITION LIMIT (Early check) ─────────────────────────────────
+        # Cek SEBELUM analisa berat agar tidak buang komputasi jika sudah penuh.
+        # Gunakan ALL positions tanpa filter magic — broker bisa beda nama symbol.
+        max_pos = self.config.risk.max_positions
+
+        # Ambil semua posisi (tanpa filter magic) agar symbol xauusdm/XAUUSD
+        # keduanya terdeteksi. Symbol di-resolve otomatis oleh get_open_positions.
+        all_positions = self.mt5.get_open_positions(symbol=self.config.symbol)
+        actual_open = len(all_positions) if all_positions is not None else 0
+
+        if actual_open >= max_pos:
+            self._last_filter_results.append({
+                "name": "Position Limit",
+                "passed": False,
+                "detail": f"Posisi terbuka {actual_open}/{max_pos} — entri dibatalkan",
+            })
+            logger.info(
+                f"[POSITION LIMIT] {actual_open}/{max_pos} posisi terbuka "
+                f"(symbol: {self.config.symbol}) — entri baru dibatalkan"
+            )
+            return
+
+        # ── 7. Analisa filter entry ───────────────────────────────────────────
+        # Check regime allows trading
         regime_sleep = regime_state and regime_state.recommendation == "SLEEP"
         regime_enabled = self._is_filter_enabled("regime_filter")
         regime_blocked = regime_sleep and regime_enabled
@@ -1831,11 +1924,15 @@ class TradingBot:
 
         logger.info(f"Smart Risk: Lot={safe_lot}, Risk=${risk_amount:.2f} ({risk_percent:.2f}%), Mode={risk_rec['mode']}")
 
-        # 13. Check position limit (max 2 concurrent positions)
+        # 13. Software guard check (daily loss / state) — MT5 count sudah dicek di #6.5
         can_open, limit_reason = self.smart_risk.can_open_position()
-        self._last_filter_results.append({"name": "Position Limit", "passed": can_open, "detail": limit_reason if not can_open else "OK"})
+        self._last_filter_results.append({
+            "name": "Position Limit",
+            "passed": can_open,
+            "detail": limit_reason if not can_open else "OK",
+        })
         if not can_open:
-            logger.warning(f"Position limit: {limit_reason} - skipping trade")
+            logger.warning(f"[POSITION LIMIT] {limit_reason} — entri dibatalkan")
             return
 
         # 14. Execute trade (with Emergency Broker SL)
@@ -2242,7 +2339,10 @@ class TradingBot:
 
         # Validate SL is far enough from current price (min 10 pips for XAUUSD)
         tick = self.mt5.get_tick(self.config.symbol)
-        current_price = tick.bid if signal.signal_type == "SELL" else tick.ask
+        if tick is None:
+            current_price = signal.entry_price  # Fallback to signal price if tick unavailable
+        else:
+            current_price = tick.bid if signal.signal_type == "SELL" else tick.ask
 
         min_sl_distance = 1.0  # Minimum $1 distance (10 pips for XAUUSD)
         if signal.signal_type == "BUY":
@@ -2365,7 +2465,7 @@ class TradingBot:
                     regime=regime,
                     volatility=volatility,
                     session=session_status.get("session", "unknown"),
-                    spread=self.mt5.get_symbol_info(self.config.symbol).get("spread", 0) if hasattr(self.mt5, 'get_symbol_info') else 0,
+                    spread=(self.mt5.get_symbol_info(self.config.symbol) or {}).get("spread", 0),
                     atr=0,  # ATR calculated in main loop, not available here
                     smc_signal=signal.signal_type,
                     smc_confidence=signal.confidence,
@@ -2567,6 +2667,26 @@ class TradingBot:
                     self.smart_risk.unregister_position(ticket)
                     self._pyramid_done_tickets.discard(ticket)  # Cleanup pyramid tracking
 
+                    # [Lapis 2 SL Learning Loop] Trigger retrain if consecutive losses >= 3
+                    consecutive_losses = getattr(self.smart_risk._risk_state, 'consecutive_losses', 0)
+                    if consecutive_losses >= 3 and self.auto_trainer:
+                        logger.warning(
+                            f"[ML RELEARN TRIGGER] Consecutive losses: {consecutive_losses} "
+                            f"→ triggering immediate ML retrain to adapt to current market"
+                        )
+                        # Run retrain async (non-blocking)
+                        asyncio.create_task(
+                            asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: self.auto_trainer.trigger_retrain(
+                                    reason=f"consecutive_sl_{consecutive_losses}",
+                                    connector=self.mt5,
+                                    symbol=self.config.symbol,
+                                    timeframe="M15",
+                                ),
+                            )
+                        )
+
                     # Log trade close for auto-training
                     try:
                         trade_info = self._open_trade_info.get(ticket, {})
@@ -2594,6 +2714,31 @@ class TradingBot:
 
                     # Send notification
                     await self.notifications.notify_trade_close_smart(ticket, profit, current_price, message)
+
+                    # [Lapis 3 SL Learning] AI analysis untuk SL events (informational → Telegram)
+                    if profit < 0 and os.getenv("SL_ANALYSIS_ENABLED", "true").lower() in ("true", "1", "yes"):
+                        # Collect SL context
+                        sl_price = trade_info.get("stop_loss", current_price - 5)  # Fallback
+                        duration_minutes = int((datetime.now() - trade_info.get("entry_time", datetime.now())).total_seconds() / 60)
+                        session = getattr(self.session_filter, "get_current_session", lambda: "UNKNOWN")() if self.session_filter else "UNKNOWN"
+
+                        # Run SL analysis async (non-blocking)
+                        asyncio.create_task(
+                            self._analyze_and_log_sl_event(
+                                entry_price=entry_price,
+                                sl_price=sl_price,
+                                exit_price=current_price,
+                                profit_usd=profit,
+                                profit_pips=pips,
+                                duration_minutes=duration_minutes,
+                                session=session,
+                                regime=regime_state.regime.value if regime_state else "UNKNOWN",
+                                smc_confidence=trade_info.get("smc_confidence", 0.5),
+                                ml_confidence=ml_prediction.confidence if ml_prediction else 0.5,
+                                smc_reason=trade_info.get("smc_reason", "UNKNOWN"),
+                                ticket=ticket,
+                            )
+                        )
 
                     # Check for critical limit violations and send alerts
                     if risk_result.get("total_limit_hit"):
@@ -2680,7 +2825,175 @@ class TradingBot:
 
         # Send critical alert
         await self.notifications.send_emergency_close_result(closed_count, failed_tickets)
-    
+
+    async def _detect_broker_closed_positions(self):
+        """
+        Detect positions that were closed by broker (SL/TP hit) and log them.
+
+        This is Lapis 1 of SL Learning Loop: detect broker-triggered closes
+        that the bot doesn't actively manage (hard SL set at order time).
+
+        Called periodically to query MT5 trade history for recently closed deals.
+        """
+        if not self.trade_logger:
+            return
+
+        try:
+            # Query recent closed deals (last 24 hours)
+            from datetime import timedelta
+            from_time = datetime.now() - timedelta(hours=24)
+
+            deals = self.mt5.get_closed_deals(from_time=from_time)
+            if not deals:
+                return
+
+            for deal in deals:
+                # Only care about closing deals (not open trades, not balance entries)
+                if deal["type"] not in ("BUY_CLOSING", "SELL_CLOSING"):
+                    continue
+
+                ticket = deal["ticket"]
+                position_id = deal.get("position_id")
+                profit = deal.get("profit", 0.0)
+                symbol = deal.get("symbol", self.config.symbol)
+
+                # Skip if already logged (simple check: if ticket in recent trade logs)
+                # In production, should check against trade_logger.get_last_n_trades()
+                if ticket in getattr(self, '_logged_broker_deals', set()):
+                    continue
+
+                # Infer close reason from comment or profit direction
+                comment = deal.get("comment", "").upper()
+                if "SL" in comment or "STOP" in comment:
+                    exit_reason = "BROKER_SL"
+                elif "TP" in comment or "PROFIT" in comment:
+                    exit_reason = "BROKER_TP"
+                elif profit < 0:
+                    # Negative profit with no clear reason → likely SL or market order
+                    exit_reason = "BROKER_SL_IMPLICIT"
+                else:
+                    exit_reason = "BROKER_CLOSE"
+
+                # Log to trade logger
+                try:
+                    self.trade_logger.log_trade_close(
+                        ticket=ticket,
+                        exit_price=deal.get("price", 0.0),
+                        profit_usd=profit,
+                        profit_pips=0.0,  # Would need entry_price to calculate
+                        exit_reason=exit_reason,
+                        exit_regime="UNKNOWN",  # Could fetch from regime_detector
+                        exit_ml_signal="UNKNOWN",
+                        exit_ml_confidence=0.0,
+                    )
+                    logger.info(
+                        f"Logged broker-closed position: ticket={ticket}, "
+                        f"reason={exit_reason}, profit=${profit:.2f}"
+                    )
+
+                    # Record to smart_risk for consecutive loss tracking
+                    if profit < 0:
+                        self.smart_risk.record_trade_result(profit)
+
+                    # Send Telegram notification untuk broker-closed position
+                    try:
+                        exit_price = deal.get("price", 0.0)
+                        await self.telegram.send_message(
+                            f"""🔚 <b>POSITION CLOSED (BROKER)</b>
+
+<b>Ticket:</b> #{ticket}
+<b>Reason:</b> {exit_reason}
+<b>Price:</b> ${exit_price:,.2f}
+<b>Profit:</b> <code>${profit:+,.2f}</code>
+
+⏰ {datetime.now(ZoneInfo('Asia/Jakarta')).strftime('%H:%M:%S')} WIB"""
+                        )
+                    except Exception as te:
+                        logger.warning(f"Failed to send broker close notification: {te}")
+
+                except Exception as e:
+                    logger.error(f"Failed to log broker-closed deal {ticket}: {e}")
+
+                # Mark as logged
+                if not hasattr(self, '_logged_broker_deals'):
+                    self._logged_broker_deals = set()
+                self._logged_broker_deals.add(ticket)
+
+        except Exception as e:
+            logger.warning(f"Error detecting broker-closed positions: {e}")
+
+    async def _analyze_and_log_sl_event(
+        self,
+        entry_price: float,
+        sl_price: float,
+        exit_price: float,
+        profit_usd: float,
+        profit_pips: float,
+        duration_minutes: int,
+        session: str,
+        regime: str,
+        smc_confidence: float,
+        ml_confidence: float,
+        smc_reason: str,
+        ticket: int,
+    ):
+        """
+        Analyze SL event and send result to Telegram (Lapis 3 enrichment).
+
+        Called async (non-blocking) after SL close for narrative analysis.
+        Results sent to Telegram as informational notification.
+        Optional: if SL_ANALYSIS_IMPACT_ENABLED=true, confidence_modifier is stored
+        for next trade entry.
+        """
+        if not self.ai_provider or not self.ai_provider.enabled:
+            return
+
+        try:
+            # Get AI analysis
+            sl_analysis = await self.ai_provider.analyze_sl_event(
+                entry_price=entry_price,
+                sl_price=sl_price,
+                exit_price=exit_price,
+                profit_usd=profit_usd,
+                profit_pips=profit_pips,
+                duration_minutes=duration_minutes,
+                session=session,
+                regime=regime,
+                smc_confidence=smc_confidence,
+                ml_confidence=ml_confidence,
+                smc_reason=smc_reason,
+            )
+
+            # Send to Telegram (always, informational)
+            try:
+                await self.telegram.send_message(
+                    f"""🔍 **SL Analysis #{ticket}**
+
+**Root Cause:** {sl_analysis.root_cause}
+
+**Avoidance:** {sl_analysis.avoidance_strategy}
+
+**Lessons:** {sl_analysis.lessons_learned}
+
+**Recommendation:** {sl_analysis.recommendation}
+
+_Impact on next trade: {('Confidence ' + ('-' if sl_analysis.confidence_modifier < 0 else '+') + f'{abs(sl_analysis.confidence_modifier):.0%}') if sl_analysis.confidence_modifier != 0 else 'None (informational only)'}_ {'⚠️' if os.getenv('SL_ANALYSIS_IMPACT_ENABLED', 'false').lower() in ('true', '1', 'yes') else '(disabled)'}
+"""
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send SL analysis to Telegram: {e}")
+
+            # Optionally apply confidence_modifier to next trade (if enabled)
+            if os.getenv("SL_ANALYSIS_IMPACT_ENABLED", "false").lower() in ("true", "1", "yes"):
+                self._sl_confidence_modifier = sl_analysis.confidence_modifier
+                logger.info(
+                    f"[SL IMPACT ENABLED] SL analysis modifier stored: {self._sl_confidence_modifier:.3f} "
+                    f"(will apply to next trade confidence if enabled)"
+                )
+
+        except Exception as e:
+            logger.error(f"Error in SL analysis: {e}")
+
     def _on_new_day(self):
         """Handle new trading day."""
         logger.info("=" * 60)
