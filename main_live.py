@@ -2441,6 +2441,26 @@ class TradingBot:
                 "direction": signal.signal_type,
             }
 
+            # Capture feature snapshot for trade feedback training
+            features_entry = {}
+            try:
+                cached_df = getattr(self, "_cached_df", None)
+                if cached_df is not None and len(cached_df) > 0:
+                    exclude = {"time", "open", "high", "low", "close", "volume",
+                               "target", "target_return", "multi_bar_target", "_sample_weight",
+                               "tick_volume", "spread", "real_volume"}
+                    feat_cols = [c for c in cached_df.columns
+                                 if c not in exclude
+                                 and cached_df[c].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.Int8, pl.Boolean]]
+                    if feat_cols:
+                        last_row = cached_df.tail(1).select(feat_cols)
+                        features_entry = {
+                            col: (float(val) if val is not None else 0.0)
+                            for col, val in zip(last_row.columns, last_row.row(0))
+                        }
+            except Exception as e:
+                logger.debug(f"Could not capture features_at_entry: {e}")
+
             # Log trade for auto-training
             try:
                 # Get SMC details
@@ -2481,6 +2501,7 @@ class TradingBot:
                     dynamic_threshold=float(dynamic_threshold) if dynamic_threshold else 0.7,
                     balance=self.mt5.account_balance,
                     equity=self.mt5.account_equity,
+                    features=features_entry,
                 )
             except Exception as e:
                 logger.warning(f"Failed to log trade open: {e}")

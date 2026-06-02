@@ -173,7 +173,7 @@ class TradingModelV2:
         available_features = [f for f in feature_cols if f in df.columns]
 
         # Exclude training-only features that won't be available during live prediction
-        training_only = {"target_return", "target", "multi_bar_target"}
+        training_only = {"target_return", "target", "multi_bar_target", "_sample_weight"}
         available_features = [f for f in available_features if f not in training_only]
 
         if len(available_features) < len(feature_cols):
@@ -219,6 +219,12 @@ class TradingModelV2:
 
         self.feature_names = available_features
 
+        # Extract sample weights if present (AFTER null filtering to ensure length matches X)
+        sample_weight_arr = None
+        if "_sample_weight" in df_work.columns:
+            sample_weight_arr = df_work["_sample_weight"].fill_null(1.0).to_numpy().astype(np.float32)
+            logger.info(f"Sample weights loaded: {len(sample_weight_arr)} bars")
+
         # Extract features and target
         X = df_clean.select(available_features).to_numpy()
         y = df_clean.select(target_col).to_numpy().ravel()
@@ -236,11 +242,14 @@ class TradingModelV2:
         X_test = X[test_start_idx:]
         y_test = y[test_start_idx:]
 
+        # Split sample weights to match train/test split (if present)
+        w_train = sample_weight_arr[:split_idx] if sample_weight_arr is not None else None
+
         logger.info(f"Training {self.model_type.value} with {len(X_train)} samples, testing with {len(X_test)} samples")
 
         # Train based on model type
         if self.model_type in [ModelType.XGBOOST_BINARY, ModelType.XGBOOST_3CLASS]:
-            self._fit_xgboost(X_train, y_train, X_test, y_test, num_boost_round, early_stopping_rounds)
+            self._fit_xgboost(X_train, y_train, X_test, y_test, num_boost_round, early_stopping_rounds, w_train)
 
         elif self.model_type == ModelType.LIGHTGBM_BINARY:
             if lgb is None:
@@ -250,7 +259,7 @@ class TradingModelV2:
 
         elif self.model_type == ModelType.ENSEMBLE:
             # Train both models
-            self._fit_xgboost(X_train, y_train, X_test, y_test, num_boost_round, early_stopping_rounds)
+            self._fit_xgboost(X_train, y_train, X_test, y_test, num_boost_round, early_stopping_rounds, w_train)
             if lgb is not None:
                 self._fit_lightgbm(X_train, y_train, X_test, y_test, num_boost_round, early_stopping_rounds)
             else:
@@ -264,13 +273,13 @@ class TradingModelV2:
 
         return self
 
-    def _fit_xgboost(self, X_train, y_train, X_test, y_test, num_boost_round, early_stopping_rounds):
-        """Fit XGBoost model."""
+    def _fit_xgboost(self, X_train, y_train, X_test, y_test, num_boost_round, early_stopping_rounds, weight_train=None):
+        """Fit XGBoost model with optional trade outcome sample weights."""
         if xgb is None:
             logger.error("XGBoost not installed")
             return
 
-        dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=self.feature_names)
+        dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=self.feature_names, weight=weight_train)
         dtest = xgb.DMatrix(X_test, label=y_test, feature_names=self.feature_names)
 
         evals = [(dtrain, "train"), (dtest, "eval")]

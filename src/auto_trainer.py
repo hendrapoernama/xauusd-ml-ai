@@ -19,6 +19,8 @@ from typing import Optional, Dict, Tuple
 from zoneinfo import ZoneInfo
 from loguru import logger
 import polars as pl
+import numpy as np
+from backtests.ml_v2.ml_v2_target import TargetBuilder
 
 # Database imports
 try:
@@ -402,6 +404,126 @@ class AutoTrainer:
                 shutil.rmtree(old_backup)
                 logger.debug(f"Removed old backup: {old_backup}")
 
+    def _build_trade_weights_column(self, df: pl.DataFrame) -> Optional[pl.Series]:
+        """
+        Build sample weight column from trade history win/loss outcomes.
+        Bars near winning trades → weight 3.0x (learn this pattern).
+        Bars near losing trades → weight 2.0x (penalize indirectly).
+        Other bars → weight 1.0 (neutral).
+        """
+        import glob
+        import csv
+        from datetime import datetime
+
+        trades_dir = self.data_dir / "trade_logs" / "trades"
+        csv_files = sorted(glob.glob(str(trades_dir / "trades_*.csv")))
+        if not csv_files:
+            return None
+
+        trades = []
+        for csv_path in csv_files:
+            try:
+                with open(csv_path, "r", encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        try:
+                            profit = float(row.get("profit_usd", 0))
+                            open_time_str = row.get("open_time", "")
+                            direction = row.get("direction", "")
+                            if open_time_str and direction not in ("", "UNKNOWN"):
+                                dt = datetime.fromisoformat(open_time_str)
+                                if dt.tzinfo:
+                                    dt = dt.replace(tzinfo=None)
+                                trades.append({"dt": dt, "profit": profit})
+                        except (ValueError, KeyError, TypeError):
+                            continue
+            except Exception as e:
+                logger.warning(f"Could not read trade CSV {csv_path}: {e}")
+
+        if not trades:
+            return None
+
+        wins = sum(1 for t in trades if t["profit"] > 0)
+        losses = sum(1 for t in trades if t["profit"] < 0)
+        logger.info(f"Trade feedback: {len(trades)} trades ({wins} wins, {losses} losses)")
+
+        bar_times = df["time"].to_list()
+        weights = np.ones(len(bar_times), dtype=np.float32)
+
+        for trade in trades:
+            for i, bt in enumerate(bar_times):
+                if bt is None:
+                    continue
+                # Normalize to naive datetime
+                bt_naive = bt.replace(tzinfo=None) if getattr(bt, "tzinfo", None) else bt
+                try:
+                    delta_min = abs((trade["dt"] - bt_naive).total_seconds() / 60)
+                except (TypeError, AttributeError):
+                    continue
+
+                if delta_min <= 30:  # ±2 bars (M15 = 15 min/bar)
+                    w = 3.0 if trade["profit"] > 0 else 2.0
+                    weights[i] = max(weights[i], w)
+
+        n_boosted = int((weights > 1.0).sum())
+        logger.info(f"Sample weights: {n_boosted} bars boosted from {len(trades)} trades")
+
+        return pl.Series("_sample_weight", weights)
+
+    def trigger_retrain(
+        self,
+        reason: str = "manual",
+        connector=None,
+        symbol: str = "XAUUSD",
+        timeframe: str = "M15",
+    ) -> Dict:
+        """
+        Trigger immediate retrain (Lapis 2: SL Learning Loop).
+
+        Called by main_live.py when consecutive_losses >= 3 to force model
+        retraining instead of waiting for scheduled retrain at 05:00 WIB.
+
+        Args:
+            reason: Why retrain was triggered (e.g., "consecutive_sl", "low_auc")
+            connector: MT5Connector for fetching data
+            symbol: Trading symbol
+            timeframe: Timeframe for training
+
+        Returns:
+            Retrain results dict
+        """
+        if connector is None:
+            logger.warning(f"trigger_retrain({reason}): No connector provided, skipping")
+            return {"success": False, "error": "No connector"}
+
+        # Check minimum time between retrains to avoid spam
+        if self._last_retrain_time is not None:
+            time_since_last = (datetime.now(WIB) - self._last_retrain_time).total_seconds() / 3600
+            if time_since_last < self.min_hours_between_retrain / 2:  # Allow more frequent retrain via trigger
+                logger.warning(
+                    f"trigger_retrain({reason}): Too soon (only {time_since_last:.1f}h since last retrain), skipping"
+                )
+                return {
+                    "success": False,
+                    "error": f"Too soon (last retrain {time_since_last:.1f}h ago)"
+                }
+
+        logger.info(f"[RETRAIN TRIGGERED] Reason: {reason} — Starting immediate retraining...")
+
+        # Run retrain (non-weekend, normal bars)
+        results = self.retrain(
+            connector=connector,
+            symbol=symbol,
+            timeframe=timeframe,
+            is_weekend=False,
+        )
+
+        if results.get("success"):
+            logger.info(f"[RETRAIN SUCCESS] Trigger reason: {reason}")
+        else:
+            logger.warning(f"[RETRAIN FAILED] Trigger reason: {reason}, Error: {results.get('error')}")
+
+        return results
+
     def retrain(
         self,
         connector,  # MT5Connector
@@ -493,8 +615,10 @@ class AutoTrainer:
             smc = SMCAnalyzer(swing_length=5)
             df = smc.calculate_all(df)
 
-            # Create target
-            df = fe.create_target(df, lookahead=1)
+            # Create V2 multi-bar ATR-filtered target (not V1 1-bar noise)
+            target_builder = TargetBuilder()
+            df = target_builder.create_multi_bar_target(df, lookahead=3, threshold_atr_mult=0.3)
+            logger.info("Multi-bar target (lookahead=3, ATR threshold=0.3*ATR) created")
 
             # Train HMM
             logger.info("Training HMM Regime Model...")
@@ -530,6 +654,11 @@ class AutoTrainer:
 
             df = fe_v2.add_all_v2_features(df, df_h1)
 
+            # Build and attach trade outcome sample weights for training
+            weights_col = self._build_trade_weights_column(df)
+            if weights_col is not None:
+                df = df.with_columns(weights_col)
+
             # Train XGBoost V2 Model (with all available features)
             logger.info("Training XGBoost V2 Model...")
             xgb_model = TradingModelV2(
@@ -539,7 +668,8 @@ class AutoTrainer:
 
             # Auto-detect all numeric feature columns (like V3 trainer)
             exclude_cols = {"time", "open", "high", "low", "close", "volume", "target",
-                           "tick_volume", "spread", "real_volume", "multi_bar_target"}
+                           "target_return", "tick_volume", "spread", "real_volume",
+                           "multi_bar_target", "_sample_weight"}
             feature_cols = [
                 col for col in df.columns
                 if col not in exclude_cols and df[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.Int8, pl.Boolean]
@@ -549,7 +679,7 @@ class AutoTrainer:
             xgb_model.fit(
                 df,
                 feature_cols,
-                target_col="target",
+                target_col="multi_bar_target",
                 train_ratio=0.7,
                 num_boost_round=num_boost_round,
                 early_stopping_rounds=5,
@@ -557,14 +687,22 @@ class AutoTrainer:
 
             if xgb_model.fitted:
                 results["xgb_trained"] = True
-                # V2 model stores AUC as xgb_train_score/xgb_test_score
                 results["xgb_train_auc"] = xgb_model._train_metrics.get("xgb_train_score", 0)
                 results["xgb_test_auc"] = xgb_model._train_metrics.get("xgb_test_score", 0)
                 results["train_accuracy"] = xgb_model._train_metrics.get("train_accuracy", 0)
                 results["test_accuracy"] = xgb_model._train_metrics.get("test_accuracy", 0)
-                results["n_features"] = len(feature_cols)
+                results["n_features"] = len(xgb_model.feature_names or feature_cols)
                 logger.info(f"XGBoost V2 trained: Train AUC={results['xgb_train_auc']:.4f}, Test AUC={results['xgb_test_auc']:.4f}")
-                logger.info(f"  Features: {len(feature_cols)}")
+                logger.info(f"  Features used: {results['n_features']}")
+            else:
+                # Capture specific reason for fit failure
+                train_samples = len(df.filter(pl.col("target").is_not_null())) if "target" in df.columns else 0
+                results["error"] = (
+                    f"XGBoost fit failed — hanya {train_samples} sampel valid "
+                    f"dari {len(df)} bar setelah null handling. "
+                    f"Cek fitur V2 atau data MT5."
+                )
+                logger.error(f"XGBoost tidak ter-fit: {results['error']}")
 
             # Save training data
             training_data_path = self.data_dir / "training_data.parquet"
@@ -702,6 +840,9 @@ class AutoTrainer:
 
 def create_auto_trainer() -> AutoTrainer:
     """Create default auto trainer instance."""
+    # Respect DB_ENABLED env var
+    db_enabled = os.getenv("DB_ENABLED", "auto").lower() in ("true", "1", "yes")
+
     return AutoTrainer(
         models_dir="models",
         data_dir="data",
@@ -709,7 +850,7 @@ def create_auto_trainer() -> AutoTrainer:
         weekend_retrain=True,
         min_hours_between_retrain=20,
         backup_models=True,
-        use_db=True,
+        use_db=db_enabled,             # Respect DB_ENABLED from .env
         min_auc_threshold=0.65,        # Alert if AUC drops below 0.65
         auto_retrain_on_low_auc=True,  # Auto retrain when AUC is low
     )
