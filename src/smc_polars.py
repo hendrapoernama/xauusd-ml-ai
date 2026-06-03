@@ -110,9 +110,9 @@ class SMCAnalyzer:
         if structure_aligned:
             conf += self.confidence_weights["structure_aligned"]
 
-        # BOS/CHoCH confirmation
-        if has_break:
-            conf += self.confidence_weights["bos_choch"]
+        # BOS/CHoCH confirmation — DISABLED (Optimization 3: 0% win rate on BOS/CHoCH+FVG)
+        # if has_break:
+        #     conf += self.confidence_weights["bos_choch"]
 
         # FVG present
         if has_fvg:
@@ -914,6 +914,12 @@ class SMCAnalyzer:
             logger.info(f"SMC Signal: {signal.signal_type} @ {signal.entry_price:.5f}, "
                        f"SL: {signal.stop_loss:.5f}, TP: {signal.take_profit:.5f}, "
                        f"RR: {signal.risk_reward:.2f}, Confidence: {signal.confidence:.2f}")
+
+            # Optimization 1: Filter weak signals (confidence < 75%)
+            min_confidence_threshold = 0.75
+            if signal.confidence < min_confidence_threshold:
+                logger.info(f"[SIGNAL FILTERED] {signal.signal_type} confidence {signal.confidence:.0%} < {min_confidence_threshold:.0%} threshold")
+                return None
 
         return signal
 

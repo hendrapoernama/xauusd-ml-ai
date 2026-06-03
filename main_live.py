@@ -1284,7 +1284,12 @@ class TradingBot:
                     if "regime_confidence" not in df.columns:
                         df = df.with_columns(pl.lit(1.0).alias("regime_confidence"))
                     feature_cols = self._get_available_features(df)
-                    ml_prediction = self.ml_model.predict(df, feature_cols)
+                    # Optimization 5: Disable ML (feature mismatch)
+                    ml_prediction = SimpleNamespace(
+                        signal="HOLD",
+                        confidence=0.5,
+                        probability=0.5,
+                    )
                     await self._smart_position_management(
                         open_positions=open_positions,
                         df=df,
@@ -1544,7 +1549,14 @@ class TradingBot:
 
         # Get ML prediction early for position management
         feature_cols = self._get_available_features(df)
-        ml_prediction = self.ml_model.predict(df, feature_cols)
+        # Optimization 5: Disable ML (feature mismatch - 37 train features vs 97 live features)
+        from types import SimpleNamespace
+        ml_prediction = SimpleNamespace(
+            signal="HOLD",
+            confidence=0.5,
+            probability=0.5,
+        )
+        logger.info("[ML DISABLED] Using SMC-only signals (feature mismatch: retrain needed)")
 
         # Store for trade logging + dashboard
         self._last_ml_signal = ml_prediction.signal
