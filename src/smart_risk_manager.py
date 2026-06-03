@@ -1177,41 +1177,42 @@ class SmartRiskManager:
 
         is_golden = market_context.get("is_golden", False) if market_context else False
 
+        # OPTIMIZATION 4: Reduce grace periods to cut losses faster
+        # Multiply all grace_minutes by 0.25 (e.g., 12 min → 3 min)
         if current_profit >= 0:
-            # In profit: full grace (regime-based)
+            # In profit: full grace (regime-based), scaled down
             if regime in ("ranging", "mean_reverting"):
-                grace_minutes = 12
+                grace_minutes = 3  # was 12 (12 * 0.25)
             elif regime in ("high_volatility", "volatile", "crisis"):
-                grace_minutes = 10
+                grace_minutes = 2.5  # was 10 (10 * 0.25)
             elif regime == "trending":
-                grace_minutes = 6
+                grace_minutes = 1.5  # was 6 (6 * 0.25)
             else:
-                grace_minutes = 8
+                grace_minutes = 2  # was 8 (8 * 0.25)
         else:
-            # In loss: dynamic grace based on velocity
+            # In loss: dynamic grace based on velocity, scaled down
             loss_velocity = abs(_vel) if _vel < 0 else 0  # Only count negative velocity
 
             if loss_velocity >= 0.30:
                 # VERY FAST crash (>$0.30/sec = $18/min)
-                grace_minutes = 3  # Cut fast!
+                grace_minutes = 0.75  # was 3 (3 * 0.25)
             elif loss_velocity >= 0.15:
                 # Fast loss ($0.15/sec = $9/min)
-                grace_minutes = 4
+                grace_minutes = 1  # was 4 (4 * 0.25)
             elif loss_velocity >= 0.08:
                 # Moderate loss ($0.08/sec = $4.80/min)
-                grace_minutes = 5
+                grace_minutes = 1.25  # was 5 (5 * 0.25)
             elif loss_velocity >= 0.03:
                 # Slow loss ($0.03/sec = $1.80/min)
-                grace_minutes = 7
+                grace_minutes = 1.75  # was 7 (7 * 0.25)
             else:
-                # Very slow loss or recovering (velocity positive/near zero)
-                # Use regime-based grace but reduced 50%
+                # Very slow loss or recovering (velocity positive/near zero), scaled down
                 if regime in ("ranging", "mean_reverting"):
-                    grace_minutes = 8  # 12 -> 8
+                    grace_minutes = 2  # was 8 (8 * 0.25)
                 elif regime in ("high_volatility", "volatile", "crisis"):
-                    grace_minutes = 6  # 10 -> 6
+                    grace_minutes = 1.5  # was 6 (6 * 0.25)
                 else:
-                    grace_minutes = 5  # 8 -> 5
+                    grace_minutes = 1.25  # was 5 (5 * 0.25)
 
             # v0.2.5 FIX #3: NEVER-profitable trades get shorter grace (max 2 min)
             # If trade went negative and NEVER saw meaningful profit, cut faster.
@@ -1550,20 +1551,21 @@ class SmartRiskManager:
 
         # === PRIORITY 0: EMERGENCY SAFETY CHECKS ===
 
-        # CHECK -1: NO RECOVERY ZONE ($15 threshold)
-        # If loss >= $15, exit immediately - no point waiting for recovery
+        # OPTIMIZATION 4: Tighten loss caps to cut losses faster
+        # CHECK -1: NO RECOVERY ZONE ($10 threshold, was $15)
+        # If loss >= $10, exit immediately - no point waiting for recovery
         # v0.2.5f: Fixed unit — current_profit is in DOLLARS (was 1500=$1500, never triggered)
-        NO_RECOVERY_THRESHOLD = 15.0  # $15.00
+        NO_RECOVERY_THRESHOLD = 10.0  # was $15.00, now $10.00
         if current_profit <= -NO_RECOVERY_THRESHOLD:
             return True, ExitReason.POSITION_LIMIT, (
                 f"[NO RECOVERY] Loss ${abs(current_profit):.2f} too deep "
                 f"(threshold ${NO_RECOVERY_THRESHOLD:.2f}) - cut immediately"
             )
 
-        # CHECK 0: EMERGENCY CAP ($20)
+        # CHECK 0: EMERGENCY CAP ($10, was $20)
         # Absolute maximum loss cap - last resort protection
         # v0.2.5f: Fixed unit — current_profit is in DOLLARS (was 2000=$2000, never triggered)
-        EMERGENCY_MAX_LOSS = 20.0  # $20.00
+        EMERGENCY_MAX_LOSS = 10.0  # was $20.00, now $10.00
         if current_profit <= -EMERGENCY_MAX_LOSS:
             return True, ExitReason.POSITION_LIMIT, (
                 f"[EMERGENCY CAP] Max loss ${abs(current_profit):.2f} exceeded "

@@ -1774,12 +1774,14 @@ class TradingBot:
         if signal_blocked:
             return
 
-        # 10.1 H1 Bias — PENDUKUNG SAJA (v0.2.5d: tidak memblokir, hanya penalti confidence)
-        # SMC is MASTER. H1 aligned = boost 5%, H1 opposed = penalti 10%
+        # 10.1 H1 Bias — MANDATORY BLOCKING IN LOW-VOL (Optimization 2)
+        # SMC is MASTER, but in low-volatility regime, H1 must be aligned
+        # H1 aligned = boost 5%, H1 opposed in low-vol = BLOCK, H1 opposed in high-vol = penalti 10%
         h1_enabled = self._is_filter_enabled("h1_bias")
-        h1_passed = True  # Always pass — never block
+        h1_passed = True
         h1_detail = f"H1={h1_bias}"
         h1_penalty = 1.0
+        in_low_vol = regime_state and regime_state.regime == MarketRegime.LOW_VOLATILITY
 
         if h1_enabled and final_signal is not None:
             h1_opposed = (
@@ -1796,16 +1798,27 @@ class TradingBot:
                 h1_detail = f"Aligned {h1_bias} (+5%)"
                 logger.info(f"H1 Filter: {final_signal.signal_type} aligned with H1={h1_bias} (+5% boost)")
             elif h1_opposed:
-                h1_penalty = 0.90  # 10% confidence penalty (NOT block)
-                h1_detail = f"Opposed {h1_bias} (-10%)"
-                logger.info(f"H1 Filter: {final_signal.signal_type} opposed H1={h1_bias} (-10% penalty, NOT blocked)")
+                # OPTIMIZATION 2: In low-vol regime, H1 opposition BLOCKS (mandatory alignment)
+                if in_low_vol:
+                    h1_passed = False
+                    h1_detail = f"Opposed {h1_bias} [BLOCKED in low-vol]"
+                    logger.info(f"[H1 BLOCK] {final_signal.signal_type} opposed H1={h1_bias} in low-volatility regime — BLOCKED")
+                else:
+                    # High volatility: H1 opposition only penalizes
+                    h1_penalty = 0.90  # 10% confidence penalty (NOT block)
+                    h1_detail = f"Opposed {h1_bias} (-10% in high-vol)"
+                    logger.info(f"H1 Filter: {final_signal.signal_type} opposed H1={h1_bias} (-10% penalty, not blocked in high-vol)")
             else:
                 logger.debug(f"H1 Filter: NEUTRAL — no adjustment")
 
-            # Apply H1 penalty to final signal confidence
-            final_signal.confidence *= h1_penalty
+            # Apply H1 penalty to final signal confidence (if not blocked)
+            if h1_passed:
+                final_signal.confidence *= h1_penalty
 
-        self._last_filter_results.append({"name": "H1 Bias (#31B)", "passed": True, "detail": h1_detail})
+        self._last_filter_results.append({"name": "H1 Bias (#31B)", "passed": h1_passed, "detail": h1_detail})
+
+        if not h1_passed:
+            return
 
         # 10.2 Time-of-Hour Filter (#34A: skip WIB hours 9 and 21 — backtest +$356)
         # Hour 9 WIB (02:00 UTC) = end of NY session, low liquidity
