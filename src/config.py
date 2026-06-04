@@ -60,15 +60,15 @@ class ThresholdsConfig:
     All hard-coded thresholds should be defined here.
     """
     # ML Confidence Thresholds
-    ml_min_confidence: float = 0.65        # Minimum confidence to consider signal
-    ml_entry_confidence: float = 0.70      # Default confidence for entry
-    ml_high_confidence: float = 0.75       # High confidence threshold
-    ml_very_high_confidence: float = 0.80  # Very high confidence (lot multiplier)
+    ml_min_confidence: float = 0.60        # Phase 3: Lowered from 0.65 for more entries
+    ml_entry_confidence: float = 0.65      # Phase 3: Lowered from 0.70
+    ml_high_confidence: float = 0.70       # Phase 3: Lowered from 0.75
+    ml_very_high_confidence: float = 0.75  # Phase 3: Lowered from 0.80 (for lot multiplier)
 
     # Dynamic Threshold Adjustments
-    dynamic_threshold_aggressive: float = 0.65   # Aggressive mode threshold
-    dynamic_threshold_moderate: float = 0.70     # Moderate mode threshold
-    dynamic_threshold_conservative: float = 0.75 # Conservative mode threshold
+    dynamic_threshold_aggressive: float = 0.60   # Phase 3: Lowered from 0.65
+    dynamic_threshold_moderate: float = 0.65     # Phase 3: Lowered from 0.70
+    dynamic_threshold_conservative: float = 0.70 # Phase 3: Lowered from 0.75
 
     # Risk Management Thresholds
     trend_reversal_confidence: float = 0.75  # ML confidence to trigger reversal close

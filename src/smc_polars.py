@@ -916,7 +916,7 @@ class SMCAnalyzer:
                        f"RR: {signal.risk_reward:.2f}, Confidence: {signal.confidence:.2f}")
 
             # Optimization 1: Filter weak signals (confidence < 75%)
-            min_confidence_threshold = 0.75
+            min_confidence_threshold = 0.65  # Phase 3: Lowered from 75% to enable more profitable entries
             if signal.confidence < min_confidence_threshold:
                 logger.info(f"[SIGNAL FILTERED] {signal.signal_type} confidence {signal.confidence:.0%} < {min_confidence_threshold:.0%} threshold")
                 return None

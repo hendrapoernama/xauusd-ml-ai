@@ -1549,14 +1549,13 @@ class TradingBot:
 
         # Get ML prediction early for position management
         feature_cols = self._get_available_features(df)
-        # Optimization 5: Disable ML (feature mismatch - 37 train features vs 97 live features)
-        from types import SimpleNamespace
-        ml_prediction = SimpleNamespace(
-            signal="HOLD",
-            confidence=0.5,
-            probability=0.5,
-        )
-        logger.info("[ML DISABLED] Using SMC-only signals (feature mismatch: retrain needed)")
+        try:
+            ml_prediction = self.ml_model.predict(df, feature_cols)
+            logger.debug(f"ML: {ml_prediction.signal}({ml_prediction.confidence:.0%})")
+        except Exception as e:
+            logger.warning(f"ML prediction failed: {e}, using SMC-only")
+            from types import SimpleNamespace
+            ml_prediction = SimpleNamespace(signal="HOLD", confidence=0.5, probability=0.5)
 
         # Store for trade logging + dashboard
         self._last_ml_signal = ml_prediction.signal
