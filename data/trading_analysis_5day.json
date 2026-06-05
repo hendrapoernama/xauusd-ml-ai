@@ -1,0 +1,154 @@
+{
+  "timestamp": "2026-06-06T06:40:25.114588",
+  "analysis": {
+    "performance": {
+      "total_trades": 10,
+      "winning_trades": 4,
+      "losing_trades": 6,
+      "total_profit": -16.740000000000002,
+      "win_rate": 40.0,
+      "avg_win": 2.52,
+      "avg_loss": -4.470000000000001,
+      "largest_win": 3.27,
+      "largest_loss": -15.46,
+      "profit_factor": 0.3758389261744966
+    },
+    "ml_signals": {
+      "HOLD": {
+        "count": 8,
+        "wins": 2,
+        "accuracy": 25.0,
+        "avg_profit": -2.8437500000000004,
+        "avg_confidence": 0.5
+      }
+    },
+    "smc_patterns": {
+      "fvg": {
+        "count": 8,
+        "wins": 2,
+        "win_rate": 25.0,
+        "avg_profit": -2.8437500000000004,
+        "avg_confidence": 0.7585625
+      },
+      "bos": {
+        "count": 4,
+        "wins": 0,
+        "win_rate": 0.0,
+        "avg_profit": -6.1225000000000005,
+        "avg_confidence": 0.8293750000000001
+      },
+      "choch": {
+        "count": 4,
+        "wins": 0,
+        "win_rate": 0.0,
+        "avg_profit": -6.1225000000000005,
+        "avg_confidence": 0.8293750000000001
+      }
+    },
+    "feature_importance": {
+      "train_auc": 0.6538242728626638,
+      "test_auc": 0.6364071545009039,
+      "top_features": [
+        {
+          "name": "ofi_pseudo",
+          "importance": 0.2909
+        },
+        {
+          "name": "ob",
+          "importance": 0.2199
+        },
+        {
+          "name": "ob_distance_atr",
+          "importance": 0.1668
+        },
+        {
+          "name": "sell_volume",
+          "importance": 0.0616
+        },
+        {
+          "name": "ob_bottom",
+          "importance": 0.0504
+        },
+        {
+          "name": "h1_rsi",
+          "importance": 0.0332
+        },
+        {
+          "name": "ofi_divergence",
+          "importance": 0.0308
+        },
+        {
+          "name": "returns_1",
+          "importance": 0.0269
+        },
+        {
+          "name": "h1_ema20_distance",
+          "importance": 0.0136
+        },
+        {
+          "name": "regime_transition_prob",
+          "importance": 0.0135
+        }
+      ]
+    },
+    "exit_analysis": {
+      "take_profit": {
+        "count": 3,
+        "win_rate": 100.0,
+        "avg_profit": 3.0933333333333333
+      },
+      "position_limit": {
+        "count": 3,
+        "win_rate": 0.0,
+        "avg_profit": -8.096666666666668
+      },
+      "weekend_close": {
+        "count": 3,
+        "win_rate": 33.33333333333333,
+        "avg_profit": 0.023333333333333355
+      },
+      "trend_reversal": {
+        "count": 1,
+        "win_rate": 0.0,
+        "avg_profit": -1.8
+      }
+    },
+    "recommendations": [
+      {
+        "priority": "HIGH",
+        "category": "ML Signal",
+        "issue": "HOLD signal has 25.0% win rate",
+        "action": "Lower confidence threshold for HOLD or retrain model",
+        "potential_impact": "+5-10% win rate"
+      },
+      {
+        "priority": "HIGH",
+        "category": "Entry Filters",
+        "issue": "Win rate is 40.0%, below 45% threshold",
+        "action": "Tighten entry filters: require higher ML confidence + SMC confirmation",
+        "potential_impact": "+10-15% win rate"
+      },
+      {
+        "priority": "HIGH",
+        "category": "Exit Strategy",
+        "issue": "position_limit exits at 0.0% win rate",
+        "action": "Revise exit logic: avoid over-exiting on time or false breakouts",
+        "potential_impact": "+3-8% profitability"
+      },
+      {
+        "priority": "MEDIUM",
+        "category": "Feature Engineering",
+        "issue": "ofi_pseudo is 29.1% of model importance",
+        "action": "Focus on improving ofi_pseudo calculations and accuracy",
+        "potential_impact": "+2-4% model accuracy"
+      },
+      {
+        "priority": "MEDIUM",
+        "category": "Risk Management",
+        "issue": "Largest loss is > 50% of largest win (asymmetric risk)",
+        "action": "Tighten stop loss placement or use progressive stop loss",
+        "potential_impact": "+5-10% risk-adjusted returns"
+      }
+    ]
+  }
+}

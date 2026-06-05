@@ -1,6 +1,6 @@
-date:2026-06-02
-daily_loss:4.21
-daily_profit:5.53
-consecutive_losses:1
-total_loss:22.900000000000002
-saved_at:2026-06-02T23:50:06.843157+07:00
+date:2026-06-05
+daily_loss:46.169999999999995
+daily_profit:30.58
+consecutive_losses:2
+total_loss:38.49
+saved_at:2026-06-05T22:20:03.063502+07:00

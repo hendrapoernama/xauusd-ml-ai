@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "D:\Aplikasi\xaubot-ai\main_live.py", line 28, in <module>
+    import polars as pl
+ModuleNotFoundError: No module named 'polars'

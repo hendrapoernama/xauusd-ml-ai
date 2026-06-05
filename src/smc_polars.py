@@ -695,17 +695,20 @@ class SMCAnalyzer:
 
         return df
     
-    def generate_signal(self, df: pl.DataFrame) -> Optional[SMCSignal]:
+    def generate_signal(self, df: pl.DataFrame, regime: str = "", volatility: float = 0) -> Optional[SMCSignal]:
         """
         Generate trading signal based on SMC analysis.
 
-        Signal Logic (RELAXED for active trading):
+        Signal Logic (IMPROVED):
         1. Check market structure (BOS/CHoCH) - extended lookback
         2. Find valid FVG OR Order Block in recent candles
-        3. Generate signal based on best available setup
+        3. Filter BOS/CHoCH for regime and volatility (NEW)
+        4. Generate signal based on best available setup
 
         Args:
             df: DataFrame with all SMC indicators
+            regime: Market regime (trending, ranging, volatile) - NEW FILTER
+            volatility: Market volatility value - NEW FILTER
 
         Returns:
             SMCSignal if valid setup found, None otherwise
@@ -752,6 +755,24 @@ class SMCAnalyzer:
         has_bullish_ob = 1 in recent_obs
         has_bearish_ob = -1 in recent_obs
 
+        # NEW FILTER: Skip BOS/CHoCH in low volatility or non-trending regimes
+        # This eliminates false breakouts that lose money (0% WR historically)
+        skip_bos_choch = False
+        if (has_bullish_break or has_bearish_break):
+            # BOS/CHoCH should only trade in trending markets with sufficient volatility
+            regime_lower = regime.lower() if regime else ""
+            if regime_lower in ["low_volatility", "ranging", "choppy", "neutral"]:
+                skip_bos_choch = True
+                logger.debug(f"SKIP BOS/CHoCH: Regime is {regime} (not trending)")
+            elif volatility > 0 and volatility < 0.15:
+                skip_bos_choch = True
+                logger.debug(f"SKIP BOS/CHoCH: Volatility {volatility:.3f} too low (< 0.15)")
+
+        # Clear BOS/CHoCH signals if conditions not met
+        if skip_bos_choch:
+            has_bullish_break = False
+            has_bearish_break = False
+
         # Get valid FVG/OB zone for entry
         def get_valid_bullish_zone():
             # Find most recent bullish FVG or OB
@@ -782,13 +803,14 @@ class SMCAnalyzer:
         else:
             atr = 12.0  # Default realistic ATR for XAUUSD
 
-        # SL: 1.5-2 ATR distance (protects against noise)
-        min_sl_distance = 1.5 * atr
+        # SL: 0.75 ATR distance (aggressive, smaller SL)
+        # Tuned untuk hit rate lebih tinggi dengan stop yang ketat
+        min_sl_distance = 0.75 * atr
 
-        # === FIXED RR RATIO 1:1.5 ===
-        # Based on backtest analysis: RR 1:2 only hits TP 14% of the time
-        # RR 1:1.5 is more realistic for higher hit rate
-        min_rr_ratio = 1.5
+        # === FIXED RR RATIO 2.5 ===
+        # TP besar: 2.5x risk sebanding dengan reward lebih tinggi
+        # Cocok untuk trend yang jelas + trend following
+        min_rr_ratio = 2.5
 
         # BULLISH SIGNAL CONDITIONS
         # Need: bullish structure OR recent bullish break, AND (FVG OR OB)

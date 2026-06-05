@@ -1568,7 +1568,10 @@ class TradingBot:
         self._cached_df = df
 
         # Cache SMC signal for dashboard (runs before filters so dashboard always updates)
-        smc_signal = self.smc.generate_signal(df)
+        # FIX #1: Pass regime and volatility for BOS/CHoCH filtering
+        regime_name = regime_state.regime.value if regime_state else "unknown"
+        volatility_value = regime_state.volatility if regime_state else 0
+        smc_signal = self.smc.generate_signal(df, regime=regime_name, volatility=volatility_value)
         _wib_now = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%H:%M:%S")
         if smc_signal:
             self._last_raw_smc_signal = smc_signal.signal_type
@@ -1683,16 +1686,51 @@ class TradingBot:
         actual_open = len(all_positions) if all_positions is not None else 0
 
         if actual_open >= max_pos:
-            self._last_filter_results.append({
-                "name": "Position Limit",
-                "passed": False,
-                "detail": f"Posisi terbuka {actual_open}/{max_pos} — entri dibatalkan",
-            })
-            logger.info(
-                f"[POSITION LIMIT] {actual_open}/{max_pos} posisi terbuka "
-                f"(symbol: {self.config.symbol}) — entri baru dibatalkan"
-            )
-            return
+            # IMPROVED: Don't just block - check if we should close a losing trade first
+            # This prevents killing winning trades when at max positions
+            position_limit_threshold = -20  # Only close if loss > $20
+
+            if all_positions is not None and len(all_positions) > 0:
+                # Find worst trade (most negative profit)
+                worst_profit = all_positions["profit"].min() if "profit" in all_positions.columns else 0
+                worst_ticket = None
+                if "profit" in all_positions.columns and "ticket" in all_positions.columns:
+                    worst_idx = all_positions["profit"].to_list().index(worst_profit)
+                    worst_ticket = all_positions["ticket"][worst_idx]
+
+                # Only close if significantly losing
+                if worst_profit < position_limit_threshold and worst_ticket is not None:
+                    logger.info(
+                        f"[POSITION LIMIT] {actual_open}/{max_pos} posisi terbuka. "
+                        f"Closing worst trade (ticket={worst_ticket}, loss=${worst_profit:.2f})"
+                    )
+                    # Close the worst trade to make room
+                    self.mt5.close_position(worst_ticket)
+                    # Continue to entry logic (don't return)
+                else:
+                    # Good trades exist, don't force close - just skip new entry
+                    self._last_filter_results.append({
+                        "name": "Position Limit",
+                        "passed": False,
+                        "detail": f"Posisi terbuka {actual_open}/{max_pos} — entri dibatalkan (trades profitable/small loss)",
+                    })
+                    logger.debug(
+                        f"[POSITION LIMIT] {actual_open}/{max_pos} posisi terbuka "
+                        f"(worst loss: ${worst_profit:.2f}) — entri baru dibatalkan"
+                    )
+                    return
+            else:
+                # No position data, just block entry
+                self._last_filter_results.append({
+                    "name": "Position Limit",
+                    "passed": False,
+                    "detail": f"Posisi terbuka {actual_open}/{max_pos} — entri dibatalkan",
+                })
+                logger.info(
+                    f"[POSITION LIMIT] {actual_open}/{max_pos} posisi terbuka "
+                    f"(symbol: {self.config.symbol}) — entri baru dibatalkan"
+                )
+                return
 
         # ── 7. Analisa filter entry ───────────────────────────────────────────
         # Check regime allows trading
@@ -1969,6 +2007,13 @@ class TradingBot:
         regime_state,
     ) -> Optional[SMCSignal]:
         """Combine SMC and ML signals with DYNAMIC confidence threshold."""
+        # FIX #3: SKIP HOLD SIGNALS - Never trade uncertain signals
+        # HOLD signals (confidence 0.50) are coin flips that lose money
+        if ml_prediction.signal == "HOLD":
+            if self._loop_count % 300 == 0:  # Log every 5 minutes
+                logger.debug(f"SKIP HOLD signal (confidence {ml_prediction.confidence:.0%}) - too uncertain")
+            return None
+
         # Get current price for ML-only signals
         tick = self.mt5.get_tick(self.config.symbol)
         current_price = tick.bid if tick else 0
