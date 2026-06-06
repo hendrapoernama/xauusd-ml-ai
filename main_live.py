@@ -189,6 +189,20 @@ class TradingBot:
         self.ai_provider: Optional[AIProvider] = init_ai_provider()
         if self.ai_provider and self.ai_provider.enabled:
             logger.info(f"AI Provider initialized: {self.ai_provider.model} (Fase 1: enrichment-only)")
+
+        # Initialize LLM Signal Validator (Phase 1: monitoring + cache + learning)
+        try:
+            from src.llm_signal_validator import LLMSignalValidator
+            self.llm_validator = LLMSignalValidator(
+                ai_provider=self.ai_provider,
+                cache_duration_minutes=30,
+                enabled=bool(os.getenv("LLM_VALIDATOR_ENABLED", "true").lower() == "true"),
+            )
+            if self.llm_validator.enabled:
+                logger.info("[LLM VALIDATOR] Initialized (Phase 1: monitoring-only)")
+        except Exception as e:
+            logger.warning(f"[LLM VALIDATOR] Failed to initialize: {e}")
+            self.llm_validator = None
         else:
             logger.info("AI Provider disabled — Telegram notifications will not have macro enrichment")
 
@@ -198,6 +212,10 @@ class TradingBot:
         # State tracking
         self._running = False
         self._loop_count = 0
+
+        # LLM Signal Validator tracking (Phase 1+)
+        self._last_llm_validation = None
+        self._last_llm_validation_time = "N/A"
         self._h1_bias_cache = "NEUTRAL"
         self._h1_bias_loop = 0
         self._h1_bias_score = 0.0
@@ -1999,6 +2017,22 @@ class TradingBot:
 
         # 14. Execute trade (with Emergency Broker SL)
         await self._execute_trade_safe(final_signal, position_result, regime_state)
+
+        # NEW: Phase 1 - Async LLM Signal Validation (fire-and-forget, non-blocking)
+        # Spawns validation in background after order executed
+        if self.llm_validator and self.llm_validator.enabled and final_signal is not None:
+            try:
+                asyncio.create_task(
+                    self._validate_signal_async_background(
+                        signal=final_signal,
+                        smc_signal=smc_signal,
+                        ml_prediction=ml_prediction,
+                        regime_state=regime_state,
+                        df=df,
+                    )
+                )
+            except Exception as e:
+                logger.debug(f"[LLM] Failed to spawn validation task: {e}")
     
     def _combine_signals(
         self,
@@ -3201,6 +3235,88 @@ _Impact on next trade: {('Confidence ' + ('-' if sl_analysis.confidence_modifier
             logger.error(f"Auto-retrain error: {e}")
             import traceback
             logger.debug(traceback.format_exc())
+
+    async def _validate_signal_async_background(
+        self,
+        signal,
+        smc_signal,
+        ml_prediction,
+        regime_state,
+        df,
+    ) -> None:
+        """
+        Phase 1: Async signal validation in background (fire-and-forget).
+
+        Runs AFTER trade is executed, doesn't block trading.
+        Validates signal quality and learns patterns for future trades.
+        """
+        try:
+            if not self.llm_validator:
+                return
+
+            # Get market data for validation
+            tick = self.mt5.get_tick(self.config.symbol)
+            session_status = self.session_filter.get_status_report()
+            session_name = session_status.get("current_session", "Unknown")
+            time_of_day = datetime.now(ZoneInfo("Asia/Jakarta")).hour
+
+            # Build validation context
+            atr = df["atr"].tail(1).item() if "atr" in df.columns else 12.0
+            spread_pips = (tick.ask - tick.bid) / 0.01 if tick else 0.0
+
+            # Gather SMC pattern data
+            fvg_detected = smc_signal and "FVG" in smc_signal.reason
+            ob_detected = smc_signal and "OB" in smc_signal.reason
+            bos_detected = smc_signal and ("BOS" in smc_signal.reason or hasattr(smc_signal, 'bos') and smc_signal.bos)
+            choch_detected = smc_signal and ("CHoCH" in smc_signal.reason or hasattr(smc_signal, 'choch') and smc_signal.choch)
+
+            confluence_count = sum([fvg_detected, ob_detected, bos_detected, choch_detected])
+
+            # Get momentum data
+            closes = df["close"].tail(3).to_list() if "close" in df.columns else []
+            momentum = (closes[-1] - closes[0]) if len(closes) == 3 else 0
+
+            buy_sell_ratio = 1.0  # Placeholder, could be from volume data
+            ml_agrees = ml_prediction.signal in ["BUY", "SELL"] if ml_prediction else False
+
+            # Run validation
+            result = await self.llm_validator.validate_signal_async(
+                signal_type=signal.signal_type,
+                entry_price=signal.entry_price,
+                current_price=tick.bid if tick else signal.entry_price,
+                atr=atr,
+                spread_pips=spread_pips,
+                fvg_detected=fvg_detected,
+                fvg_distance_atr=0.0,  # Would need to calc from smc_signal
+                ob_detected=ob_detected,
+                ob_distance_atr=0.0,
+                bos_detected=bos_detected,
+                choch_detected=choch_detected,
+                confluence_count=confluence_count,
+                buy_sell_ratio=buy_sell_ratio,
+                momentum=momentum,
+                regime=regime_state.regime.value if regime_state else "unknown",
+                volatility=regime_state.volatility_state if regime_state and hasattr(regime_state, 'volatility_state') else "medium",
+                session=session_name,
+                time_of_day=time_of_day,
+                ml_agrees=ml_agrees,
+                smc_confidence=smc_signal.confidence if smc_signal else 0.0,
+                ml_confidence=ml_prediction.confidence if ml_prediction else 0.0,
+            )
+
+            # Log result (Phase 1: monitoring only)
+            logger.info(
+                f"[LLM VALIDATION] {signal.signal_type}: Valid={result.is_valid}, "
+                f"Modifier={result.confidence_modifier:+.3f}, Confidence={result.confidence_in_modifier:.2f}"
+            )
+
+            # Store in bot status for dashboard
+            self._last_llm_validation = result
+            self._last_llm_validation_time = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%H:%M:%S")
+
+        except Exception as e:
+            logger.debug(f"[LLM VALIDATION] Background validation failed (non-blocking): {e}")
+            # No-op on failure, doesn't impact trading
 
 
 async def main():

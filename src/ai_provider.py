@@ -633,6 +633,76 @@ Be specific: reference the session, regime, signal strength, etc.
             timestamp=time.time(),
         )
 
+    async def analyze_signal_async(
+        self,
+        signal_data: Dict[str, Any],
+    ) -> str:
+        """
+        Analyze trading signal for validation (Phase 1+).
+
+        Args:
+            signal_data: Dict with 'prompt' and optionally 'max_tokens'
+
+        Returns:
+            LLM response string (JSON format expected)
+        """
+        if not self.enabled or not self._client:
+            return '{"is_valid": true, "confidence_modifier": 0.0, "reasoning": "AI disabled"}'
+
+        prompt = signal_data.get("prompt", "Validate this signal")
+        max_tokens = signal_data.get("max_tokens", 200)
+
+        try:
+            result = await asyncio.wait_for(
+                self._call_llm_signal_async(prompt, max_tokens),
+                timeout=self.timeout,
+            )
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Signal validation timeout ({self.timeout}s)")
+            return '{"is_valid": true, "confidence_modifier": 0.0, "reasoning": "LLM timeout"}'
+        except Exception as e:
+            logger.warning(f"Signal validation error: {e}")
+            return '{"is_valid": true, "confidence_modifier": 0.0, "reasoning": "LLM error"}'
+
+    async def _call_llm_signal_async(self, prompt: str, max_tokens: int) -> str:
+        """Call LLM for signal validation."""
+        if self.provider_name == "anthropic":
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                self._call_anthropic_signal_sync,
+                prompt,
+                max_tokens,
+            )
+        else:
+            return await self._call_http_signal_async(prompt, max_tokens)
+
+    def _call_anthropic_signal_sync(self, prompt: str, max_tokens: int) -> str:
+        """Call Anthropic API for signal validation."""
+        if not self._client:
+            return '{"is_valid": true, "confidence_modifier": 0.0, "reasoning": "No client"}'
+
+        try:
+            response = self._client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.content[0].text
+        except Exception as e:
+            logger.warning(f"Anthropic signal validation failed: {e}")
+            return '{"is_valid": true, "confidence_modifier": 0.0, "reasoning": "API error"}'
+
+    async def _call_http_signal_async(self, prompt: str, max_tokens: int) -> str:
+        """Call HTTP-based LLM for signal validation."""
+        if not HTTPX_AVAILABLE or not self._client:
+            return '{"is_valid": true, "confidence_modifier": 0.0}'
+
+        # Implement for HTTP providers (Z.AI, DeepSeek, etc) if needed
+        # For now, return neutral fallback
+        return '{"is_valid": true, "confidence_modifier": 0.0, "reasoning": "HTTP provider not configured"}'
+
     async def shutdown(self):
         """Graceful shutdown."""
         if isinstance(self._client, httpx.AsyncClient):
