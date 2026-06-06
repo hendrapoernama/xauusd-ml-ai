@@ -148,6 +148,71 @@ class AdvancedExitConfig:
 
 
 @dataclass
+class LLMConfig:
+    """
+    LLM Signal Validator configuration (Phase 1-3).
+    Controls Claude LLM integration with SMC and ML signals.
+    """
+    # Phase 1: Monitoring & Caching (Week 1)
+    enabled: bool = field(default_factory=lambda: os.getenv("LLM_ENABLED", "true").lower() == "true")
+    monitoring_enabled: bool = field(default_factory=lambda: os.getenv("LLM_MONITORING_ENABLED", "true").lower() == "true")
+
+    # Phase 2: Modifier Application (Week 2)
+    modifier_enabled: bool = field(default_factory=lambda: os.getenv("LLM_MODIFIER_ENABLED", "false").lower() == "true")
+    modifier_start_ratio: float = field(default_factory=lambda: float(os.getenv("LLM_MODIFIER_START_RATIO", "0.1")))  # Start 10%
+
+    # Phase 3: Macro-Aware Validation (Week 3)
+    macro_enabled: bool = field(default_factory=lambda: os.getenv("LLM_MACRO_ENABLED", "false").lower() == "true")
+
+    # Integration flags
+    with_smc: bool = field(default_factory=lambda: os.getenv("LLM_WITH_SMC", "true").lower() == "true")
+    with_ml: bool = field(default_factory=lambda: os.getenv("LLM_WITH_ML", "true").lower() == "true")
+
+    # Cache settings
+    cache_duration_minutes: int = field(default_factory=lambda: int(os.getenv("LLM_CACHE_DURATION_MIN", "30")))
+    cache_max_entries: int = field(default_factory=lambda: int(os.getenv("LLM_CACHE_MAX_ENTRIES", "1000")))
+
+    # Confidence modifier bounds
+    modifier_min: float = field(default_factory=lambda: float(os.getenv("LLM_MODIFIER_MIN", "-0.15")))
+    modifier_max: float = field(default_factory=lambda: float(os.getenv("LLM_MODIFIER_MAX", "0.10")))
+
+    # Validation thresholds
+    validation_accuracy_threshold: float = field(default_factory=lambda: float(os.getenv("LLM_ACCURACY_THRESHOLD", "0.60")))
+    modifier_effectiveness_threshold: float = field(default_factory=lambda: float(os.getenv("LLM_EFFECTIVENESS_THRESHOLD", "0.60")))
+    cache_hit_rate_target: float = field(default_factory=lambda: float(os.getenv("LLM_CACHE_HIT_RATE_TARGET", "0.40")))
+
+    # API timeout and cost control
+    api_timeout_seconds: int = field(default_factory=lambda: int(os.getenv("LLM_API_TIMEOUT_SEC", "5")))
+    daily_cost_limit_usd: float = field(default_factory=lambda: float(os.getenv("LLM_DAILY_COST_LIMIT", "1.0")))
+
+    # Logging
+    log_all_validations: bool = field(default_factory=lambda: os.getenv("LLM_LOG_ALL_VALIDATIONS", "true").lower() == "true")
+
+    def is_phase_1(self) -> bool:
+        """Phase 1: Monitoring only (zero risk)."""
+        return self.enabled and self.monitoring_enabled and not self.modifier_enabled
+
+    def is_phase_2(self) -> bool:
+        """Phase 2: Modifier application."""
+        return self.enabled and self.monitoring_enabled and self.modifier_enabled and not self.macro_enabled
+
+    def is_phase_3(self) -> bool:
+        """Phase 3: Macro-aware validation."""
+        return self.enabled and self.monitoring_enabled and self.modifier_enabled and self.macro_enabled
+
+    def get_description(self) -> str:
+        """Get current phase description."""
+        if self.is_phase_3():
+            return "Phase 3: Macro-Aware Validation (SMC + ML + Macro + Modifiers)"
+        elif self.is_phase_2():
+            return "Phase 2: Modifier Application (SMC + ML + Modifiers)"
+        elif self.is_phase_1():
+            return "Phase 1: Monitoring & Caching (SMC + ML, monitoring only)"
+        else:
+            return "LLM Validation Disabled"
+
+
+@dataclass
 class TradingConfig:
     """
     Main trading configuration.
@@ -185,6 +250,7 @@ class TradingConfig:
     regime: RegimeConfig = field(default_factory=RegimeConfig)
     thresholds: ThresholdsConfig = field(default_factory=ThresholdsConfig)
     advanced_exit: AdvancedExitConfig = field(default_factory=AdvancedExitConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
 
     # Execution
     slippage_points: int = 20          # Maximum slippage in points

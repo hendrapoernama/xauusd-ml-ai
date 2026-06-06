@@ -190,16 +190,26 @@ class TradingBot:
         if self.ai_provider and self.ai_provider.enabled:
             logger.info(f"AI Provider initialized: {self.ai_provider.model} (Fase 1: enrichment-only)")
 
-        # Initialize LLM Signal Validator (Phase 1: monitoring + cache + learning)
+        # Initialize LLM Signal Validator (Phase 1-3: monitoring + modifiers + macro)
         try:
             from src.llm_signal_validator import LLMSignalValidator
+
+            llm_config = self.config.llm
             self.llm_validator = LLMSignalValidator(
                 ai_provider=self.ai_provider,
-                cache_duration_minutes=30,
-                enabled=bool(os.getenv("LLM_VALIDATOR_ENABLED", "true").lower() == "true"),
+                cache_duration_minutes=llm_config.cache_duration_minutes,
+                modifier_min=llm_config.modifier_min,
+                modifier_max=llm_config.modifier_max,
+                enabled=llm_config.enabled,
             )
+
             if self.llm_validator.enabled:
-                logger.info("[LLM VALIDATOR] Initialized (Phase 1: monitoring-only)")
+                phase_desc = llm_config.get_description()
+                logger.info(f"[LLM VALIDATOR] Initialized - {phase_desc}")
+                logger.info(f"[LLM CONFIG] Cache: {llm_config.cache_duration_minutes}min, "
+                           f"Modifier: {llm_config.modifier_min:+.2f} to {llm_config.modifier_max:+.2f}")
+            else:
+                logger.info("[LLM VALIDATOR] Disabled (using SMC+ML only)")
         except Exception as e:
             logger.warning(f"[LLM VALIDATOR] Failed to initialize: {e}")
             self.llm_validator = None
