@@ -71,6 +71,9 @@ from src.trade_logger import TradeLogger, get_trade_logger
 from src.filter_config import FilterConfigManager
 from src.ai_provider import AIProvider, init_ai_provider, get_ai_provider
 from src.telegram_commands import register_default_commands
+from src.trading_modes import get_trading_mode_manager
+from src.entry_strategy import get_entry_strategy_manager
+from src.dynamic_mode_integration import DynamicModeIntegration
 
 
 class TradingBot:
@@ -172,8 +175,28 @@ class TradingBot:
         # Initialize Smart Risk Manager - ULTRA SAFE MODE
         self.smart_risk = create_smart_risk_manager(capital=self.config.capital)
 
+        # Initialize Trading Mode Manager - dynamic mode switching via Telegram
+        self.mode_manager = get_trading_mode_manager()
+        # Apply current mode settings to config
+        mode_config = self.mode_manager.get_mode_config()
+        if hasattr(self.config, "risk"):
+            self.config.risk.max_positions = mode_config.max_positions
+            self.config.risk.max_daily_loss = mode_config.max_daily_loss_pct
+        logger.info(f"Trading mode initialized: {self.mode_manager.get_current_mode()}")
+
+        # Initialize Dynamic Mode Integration - hourly threshold updates
+        self.dynamic_mode = DynamicModeIntegration(self.mode_manager, data_dir="data")
+        self._last_dynamic_update = None
+
+        # Initialize Entry Strategy Manager - configure entry validation method
+        self.entry_strategy_manager = get_entry_strategy_manager()
+        self.entry_strategy_manager.apply_strategy_to_trading(self)
+        logger.info(f"Entry strategy initialized: {self.entry_strategy_manager.get_current_strategy().value}")
+
         # Initialize Dynamic Confidence - threshold berdasarkan kondisi market
         self.dynamic_confidence = create_dynamic_confidence()
+        # Apply mode's ML threshold
+        self.dynamic_confidence.threshold = mode_config.ml_threshold
 
         # Initialize Telegram Notifier - smart notifications
         self.telegram = create_telegram_notifier()
@@ -213,8 +236,6 @@ class TradingBot:
         except Exception as e:
             logger.warning(f"[LLM VALIDATOR] Failed to initialize: {e}")
             self.llm_validator = None
-        else:
-            logger.info("AI Provider disabled — Telegram notifications will not have macro enrichment")
 
         # Initialize Trade Logger - for ML auto-training
         self.trade_logger = get_trade_logger()
@@ -1210,6 +1231,10 @@ class TradingBot:
                     # AUTO-RETRAINING CHECK - every 20 candles (5 hours on M15)
                     if self._loop_count % 20 == 0:
                         await self._check_auto_retrain()
+
+                    # DYNAMIC MODE UPDATE - every 4 candles (1 hour on M15)
+                    if self._loop_count % 4 == 0:
+                        await self._update_dynamic_mode_thresholds()
                 else:
                     # SAME CANDLE: Only check positions (every 10 seconds)
                     if time.time() - last_position_check >= self._position_check_interval:
@@ -3243,6 +3268,77 @@ _Impact on next trade: {('Confidence ' + ('-' if sl_analysis.confidence_modifier
 
         except Exception as e:
             logger.error(f"Auto-retrain error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+    async def _update_dynamic_mode_thresholds(self):
+        """
+        Update dynamic thresholds based on market analysis.
+        Called every 4 candles (1 hour on M15).
+        """
+        try:
+            # Only update if in DYNAMIC mode
+            if not self.dynamic_mode.should_update():
+                return
+
+            # Prepare market data
+            df = self.mt5.get_market_data(
+                symbol=self.config.symbol,
+                timeframe=self.config.execution_timeframe,
+                count=50,
+            )
+
+            if len(df) < 20:
+                logger.warning("Not enough data for dynamic threshold update")
+                return
+
+            # Calculate ATR values
+            atr_values = []
+            for i in range(max(0, len(df) - 20), len(df)):
+                row = df[i]
+                atr = abs(row["high"] - row["low"])
+                atr_values.append(atr)
+
+            # Get current market regime and H1 bias
+            regime_state = self.regime_detector.detect(df)
+            current_regime = regime_state.regime.value if regime_state else "unknown"
+
+            # Get current market data
+            tick = self.mt5.get_tick(self.config.symbol)
+            current_spread = tick.ask - tick.bid if tick else 0.3
+
+            market_data = {
+                "atr": atr_values[-1] if atr_values else 0,
+                "atr_avg": sum(atr_values) / len(atr_values) if atr_values else 0,
+                "spread": current_spread,
+                "volatility": regime_state.volatility if regime_state else 1.0,
+            }
+
+            # Update dynamic thresholds
+            thresholds = await self.dynamic_mode.update_thresholds(
+                market_data=market_data,
+                atr_values=atr_values,
+                regime=current_regime,
+                h1_bias=self._h1_bias_cache,
+                db=None,  # No direct DB access yet
+            )
+
+            if thresholds:
+                # Update ML confidence threshold
+                self.dynamic_confidence.threshold = thresholds.ml_threshold
+
+                # Log the update
+                logger.info(
+                    f"[DYNAMIC] Thresholds updated: "
+                    f"ML={thresholds.ml_threshold:.0%} | "
+                    f"SMC={thresholds.smc_threshold:.0%} | "
+                    f"Quality={thresholds.ai_quality_threshold:.0f}/100 | "
+                    f"Confidence={thresholds.confidence}%"
+                )
+                logger.debug(f"[DYNAMIC] Reason: {thresholds.reason}")
+
+        except Exception as e:
+            logger.error(f"Dynamic threshold update error: {e}")
             import traceback
             logger.debug(traceback.format_exc())
 

@@ -154,6 +154,26 @@ class TelegramNotifier:
             session = await self._get_session()
 
             url = f"{self._api_url}/sendMessage"
+
+            # Sanitize HTML — escape any invalid tags
+            if parse_mode == "HTML":
+                import re
+                # Allowed tags in Telegram HTML
+                allowed_tags = {'b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'pre', 'a'}
+
+                # Replace invalid tags with escaped versions
+                tag_pattern = r'<(/?)([a-zA-Z_][a-zA-Z0-9_-]*)'
+                def replace_invalid_tag(match):
+                    is_closing = match.group(1)
+                    tag_name = match.group(2).lower()
+                    if tag_name not in allowed_tags:
+                        # Escape the angle bracket
+                        return f"&lt;{is_closing}{tag_name}"
+                    return match.group(0)  # Keep valid tag as-is
+
+                text = re.sub(tag_pattern, replace_invalid_tag, text)
+                logger.debug(f"Telegram: Sanitized HTML tags in message")
+
             payload = {
                 "chat_id": self.chat_id,
                 "text": text,
@@ -175,9 +195,19 @@ class TelegramNotifier:
 
     # ========== COMMAND SYSTEM ==========
 
-    def register_command(self, command: str, handler):
-        """Register a command handler. Handler is an async callable returning str."""
-        self._command_handlers[command.lstrip("/")] = handler
+    def register_command(self, command: str, handler, supports_args: bool = False):
+        """
+        Register a command handler. Handler is an async callable returning str.
+
+        Args:
+            command: Command name (e.g., "status")
+            handler: Async callable that returns str response
+            supports_args: If True, handler receives (args_str) parameter
+        """
+        self._command_handlers[command.lstrip("/")] = {
+            "handler": handler,
+            "supports_args": supports_args,
+        }
 
     async def poll_commands(self) -> int:
         """
@@ -216,11 +246,28 @@ class TelegramNotifier:
                     continue
 
                 # Parse command (e.g., "/status" or "/status@botname")
-                cmd = text.split()[0].split("@")[0].lstrip("/").lower()
+                parts = text.split()
+                cmd = parts[0].split("@")[0].lstrip("/").lower()
+                args = " ".join(parts[1:]) if len(parts) > 1 else ""
 
                 if cmd in self._command_handlers:
                     try:
-                        response = await self._command_handlers[cmd]()
+                        handler_info = self._command_handlers[cmd]
+
+                        # Support old dict-style or new handlers
+                        if isinstance(handler_info, dict):
+                            handler = handler_info["handler"]
+                            supports_args = handler_info.get("supports_args", False)
+                        else:
+                            handler = handler_info
+                            supports_args = False
+
+                        # Call handler with or without args
+                        if supports_args:
+                            response = await handler(args)
+                        else:
+                            response = await handler()
+
                         if response:
                             await self.send_message(response)
                         processed += 1
@@ -247,7 +294,15 @@ class TelegramNotifier:
         cmd_list = sorted(self._command_handlers.keys())
         help_items = []
         for cmd in cmd_list:
-            doc = getattr(self._command_handlers[cmd], "_cmd_desc", "")
+            handler_info = self._command_handlers[cmd]
+
+            # Get handler and description
+            if isinstance(handler_info, dict):
+                handler = handler_info["handler"]
+            else:
+                handler = handler_info
+
+            doc = getattr(handler, "_cmd_desc", "")
             help_items.append(f"/{cmd} — {doc}" if doc else f"/{cmd}")
 
         msg = f"""📋 <b>COMMANDS</b>
@@ -1085,22 +1140,30 @@ Day Change:    {((end_balance-start_balance)/start_balance*100):+.2f}%
         """Send bot startup notification with ALL features as text array."""
         ctx = context or {}
 
+        # Helper to safely format values (escape angle brackets)
+        def safe_val(v):
+            """Convert value to string, escaping angle brackets."""
+            s = str(v)
+            # Escape any angle brackets that aren't part of HTML tags
+            s = s.replace("<", "&lt;").replace(">", "&gt;")
+            return s
+
         config_items = [
-            f"Symbol: <code>{symbol}</code>",
-            f"Mode: <code>{mode}</code>",
+            f"Symbol: <code>{safe_val(symbol)}</code>",
+            f"Mode: <code>{safe_val(mode)}</code>",
             f"Capital: <code>${capital:,.2f}</code>",
             f"Balance: <code>${balance:,.2f}</code>",
-            f"ML: <code>{ml_model_status}</code>",
+            f"ML: <code>{safe_val(ml_model_status)}</code>",
         ]
 
         risk_items = [
-            f"Risk/Trade: <code>{ctx.get('risk_per_trade', 1)}%</code>",
-            f"Max Daily Loss: <code>{ctx.get('max_daily_loss', 5)}%</code>",
-            f"Max Total Loss: <code>{ctx.get('max_total_loss', 10)}%</code>",
+            f"Risk/Trade: <code>{safe_val(ctx.get('risk_per_trade', 1))}%</code>",
+            f"Max Daily Loss: <code>{safe_val(ctx.get('max_daily_loss', 5))}%</code>",
+            f"Max Total Loss: <code>{safe_val(ctx.get('max_total_loss', 10))}%</code>",
             f"SL: <code>Smart (ATR-based + Broker safety net)</code>",
-            f"Max Lot: <code>{ctx.get('max_lot', 0.02)}</code>",
-            f"Max Positions: <code>{ctx.get('max_positions', 2)}</code>",
-            f"Cooldown: <code>{ctx.get('cooldown_seconds', 150)}s</code>",
+            f"Max Lot: <code>{safe_val(ctx.get('max_lot', 0.02))}</code>",
+            f"Max Positions: <code>{safe_val(ctx.get('max_positions', 2))}</code>",
+            f"Cooldown: <code>{safe_val(ctx.get('cooldown_seconds', 150))}s</code>",
         ]
 
         # Risk state (loaded from file)
@@ -1110,10 +1173,10 @@ Day Change:    {((end_balance-start_balance)/start_balance*100):+.2f}%
         risk_mode = ctx.get("risk_mode", "normal")
 
         state_items = [
-            f"Mode: <code>{risk_mode.upper()}</code>",
-            f"Daily Loss: <code>${daily_loss:.2f}</code>",
-            f"Total Loss: <code>${total_loss:.2f}</code>",
-            f"Streak: <code>{consec}L</code>",
+            f"Mode: <code>{safe_val(risk_mode.upper())}</code>",
+            f"Daily Loss: <code>${float(daily_loss):.2f}</code>",
+            f"Total Loss: <code>${float(total_loss):.2f}</code>",
+            f"Streak: <code>{safe_val(consec)}L</code>",
         ]
 
         session = ctx.get("session", "Unknown")
@@ -1122,8 +1185,8 @@ Day Change:    {((end_balance-start_balance)/start_balance*100):+.2f}%
         session_icon = "✅" if can_trade else "⛔"
 
         session_items = [
-            f"{session_icon} {session}",
-            f"Volatility: <code>{vol}</code>",
+            f"{session_icon} {safe_val(session)}",
+            f"Volatility: <code>{safe_val(vol)}</code>",
         ]
 
         news_emoji = "✅" if news_status == "SAFE" else "⚠️"
@@ -1335,6 +1398,11 @@ Day Change:    {((end_balance-start_balance)/start_balance*100):+.2f}%
         profit_str = f"+${total_profit:.2f}" if total_profit >= 0 else f"-${abs(total_profit):.2f}"
         emoji = "✅" if total_profit >= 0 else "❌"
 
+        # Helper to safely format values
+        def safe_val(v):
+            s = str(v)
+            return s.replace("<", "&lt;").replace(">", "&gt;")
+
         session_items = [
             f"Balance: <code>${balance:,.2f}</code>",
             f"Total Trades: <code>{total_trades}</code>",
@@ -1349,10 +1417,10 @@ Day Change:    {((end_balance-start_balance)/start_balance*100):+.2f}%
         consec = ctx.get("consecutive_losses", 0)
         session = ctx.get("session", "Unknown")
         risk_items = [
-            f"Mode: <code>{risk_mode.upper()}</code> | Streak: <code>{consec}L</code>",
-            f"Daily: <code>+${daily_profit:.2f}</code> / <code>-${daily_loss:.2f}</code>",
-            f"Total Loss: <code>${total_loss:.2f}</code>",
-            f"Session: <code>{session}</code>",
+            f"Mode: <code>{safe_val(risk_mode.upper())}</code> | Streak: <code>{consec}L</code>",
+            f"Daily: <code>+${float(daily_profit):.2f}</code> / <code>-${float(daily_loss):.2f}</code>",
+            f"Total Loss: <code>${float(total_loss):.2f}</code>",
+            f"Session: <code>{safe_val(session)}</code>",
         ]
 
         msg = f"""🔴 <b>BOT STOPPED</b>

@@ -695,7 +695,14 @@ class SMCAnalyzer:
 
         return df
     
-    def generate_signal(self, df: pl.DataFrame, regime: str = "", volatility: float = 0) -> Optional[SMCSignal]:
+    def generate_signal(
+        self,
+        df: pl.DataFrame,
+        regime: str = "",
+        volatility: float = 0,
+        min_confidence_threshold: float = 0.60,  # Dynamic from AI/ML optimizer
+        min_rr: float = 1.5,  # Dynamic from AI/ML optimizer
+    ) -> Optional[SMCSignal]:
         """
         Generate trading signal based on SMC analysis.
 
@@ -709,6 +716,8 @@ class SMCAnalyzer:
             df: DataFrame with all SMC indicators
             regime: Market regime (trending, ranging, volatile) - NEW FILTER
             volatility: Market volatility value - NEW FILTER
+            min_confidence_threshold: Minimum confidence to accept signal (dynamic from optimizer)
+            min_rr: Minimum risk-reward ratio (dynamic from optimizer)
 
         Returns:
             SMCSignal if valid setup found, None otherwise
@@ -937,10 +946,16 @@ class SMCAnalyzer:
                        f"SL: {signal.stop_loss:.5f}, TP: {signal.take_profit:.5f}, "
                        f"RR: {signal.risk_reward:.2f}, Confidence: {signal.confidence:.2f}")
 
-            # Optimization 1: Filter weak signals (confidence < 75%)
-            min_confidence_threshold = 0.65  # Phase 3: Lowered from 75% to enable more profitable entries
+            # Optimization 1: Filter weak signals (dynamic threshold from AI optimizer)
+            # Professional trading: confidence with RR 2:1+ = positive expectancy
             if signal.confidence < min_confidence_threshold:
-                logger.info(f"[SIGNAL FILTERED] {signal.signal_type} confidence {signal.confidence:.0%} < {min_confidence_threshold:.0%} threshold")
+                logger.info(f"[SIGNAL FILTERED] {signal.signal_type} confidence {signal.confidence:.0%} < {min_confidence_threshold:.0%} (dynamic)")
+                return None
+
+            # Optimization 2: Filter poor risk-reward (dynamic RR from AI optimizer)
+            # Formula: (win_rate * RR) - (loss_rate * 1) = positive expectancy
+            if signal.risk_reward < min_rr:
+                logger.info(f"[SIGNAL FILTERED] {signal.signal_type} RR {signal.risk_reward:.2f} < {min_rr} (dynamic)")
                 return None
 
         return signal

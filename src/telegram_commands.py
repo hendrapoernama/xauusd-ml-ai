@@ -15,8 +15,17 @@ from zoneinfo import ZoneInfo
 from typing import Optional, Any
 from loguru import logger
 import asyncio
+import os
 
 WIB = ZoneInfo("Asia/Jakarta")
+
+# Import new modules
+from src.trading_modes import get_trading_mode_manager
+from src.position_analysis import create_analyzer
+from src.professional_analysis import create_professional_analyzer
+from src.ai_trading_analysis import get_ai_trading_analysis
+from src.scalping_optimizer import create_scalping_optimizer
+from src.entry_strategy import get_entry_strategy_manager, EntryStrategyType
 
 
 def create_balance_command(trading_bot) -> str:
@@ -469,6 +478,375 @@ Validasi dengan risk management rules sebelum entry.
         return f"❌ Error: {e}"
 
 
+async def create_modes_command() -> str:
+    """Handler untuk /modes command. List semua trading modes."""
+    try:
+        mode_manager = get_trading_mode_manager()
+        return mode_manager.get_all_modes_summary()
+    except Exception as e:
+        logger.error(f"Error in /modes: {e}")
+        return f"❌ Error: {e}"
+
+
+async def create_mode_info_command(mode_name: str) -> str:
+    """Handler untuk /mode_info <name> command. Tampilkan detail mode spesifik."""
+    try:
+        mode_manager = get_trading_mode_manager()
+        if not mode_name:
+            return "❌ Usage: /mode_info <AGGRESSIVE|NORMAL|CONSERVATIVE|RESTRICTED>"
+        return mode_manager.get_mode_summary(mode_name.upper())
+    except Exception as e:
+        logger.error(f"Error in /mode_info: {e}")
+        return f"❌ Error: {e}"
+
+
+async def create_setmode_command(trading_bot, mode_name: Optional[str] = None) -> str:
+    """Handler untuk /setmode <name> command. Switch ke mode lain."""
+    try:
+        if not mode_name:
+            return "❌ Usage: /setmode <AGGRESSIVE|NORMAL|CONSERVATIVE|RESTRICTED>"
+
+        mode_manager = get_trading_mode_manager()
+        mode_upper = mode_name.upper()
+
+        # Validate mode
+        from src.trading_modes import TRADING_MODES
+        if mode_upper not in TRADING_MODES:
+            return f"❌ Unknown mode: {mode_upper}\nValid modes: AGGRESSIVE, NORMAL, CONSERVATIVE, RESTRICTED"
+
+        # Get old and new config
+        old_mode = mode_manager.get_current_mode()
+        cfg = TRADING_MODES[mode_upper]
+
+        # Switch mode
+        if mode_manager.set_mode(mode_upper):
+            # Apply settings to bot immediately
+            try:
+                # 1. Update config
+                if hasattr(trading_bot, "config") and hasattr(trading_bot.config, "risk"):
+                    trading_bot.config.risk.max_positions = cfg.max_positions
+                    trading_bot.config.risk.max_daily_loss = cfg.max_daily_loss_pct
+                    logger.info(f"Updated config: max_pos={cfg.max_positions}, max_loss={cfg.max_daily_loss_pct}%")
+
+                # 2. Update smart risk manager
+                if hasattr(trading_bot, "smart_risk"):
+                    trading_bot.smart_risk.max_concurrent_positions = cfg.max_positions
+                    trading_bot.smart_risk.max_daily_loss_percent = cfg.max_daily_loss_pct
+                    # Calculate USD amount for daily loss
+                    capital = trading_bot.config.capital if hasattr(trading_bot, "config") else 10000
+                    daily_loss_usd = capital * (cfg.max_daily_loss_pct / 100)
+                    trading_bot.smart_risk.max_daily_loss_usd = daily_loss_usd
+                    logger.info(f"Updated risk manager: max_pos={cfg.max_positions}, daily_loss={cfg.max_daily_loss_pct}% (${daily_loss_usd:.2f})")
+
+                # 3. Update ML threshold
+                if hasattr(trading_bot, "dynamic_confidence"):
+                    trading_bot.dynamic_confidence.threshold = cfg.ml_threshold
+                    logger.info(f"Updated ML threshold: {cfg.ml_threshold:.0%}")
+
+                # 4. Store mode in bot state for display
+                if hasattr(trading_bot, "_current_mode"):
+                    trading_bot._current_mode = mode_upper
+
+                logger.info(f"✅ Mode switched: {old_mode} → {mode_upper}")
+            except Exception as e:
+                logger.error(f"Error applying mode settings: {e}")
+                return f"⚠️ Mode file saved but config update failed: {e}"
+
+            msg = f"""✅ <b>MODE SWITCHED</b>
+
+{old_mode} → <b>{mode_upper}</b>
+
+<b>New Settings:</b>
+  • ML Threshold: <code>{cfg.ml_threshold:.0%}</code>
+  • Max Positions: <code>{cfg.max_positions}</code>
+  • Max Daily Loss: <code>{cfg.max_daily_loss_pct:.1f}%</code>
+  • Risk/Trade: <code>{cfg.risk_per_trade:.1f}%</code>
+
+<i>Settings applied immediately to live trading.</i>
+
+⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB"""
+            return msg.strip()
+        else:
+            return f"❌ Failed to switch to {mode_upper}"
+
+    except Exception as e:
+        logger.error(f"Error in /setmode: {e}")
+        return f"❌ Error: {e}"
+
+
+async def create_scalping_analysis_command() -> str:
+    """
+    Handler untuk /scalping command.
+    AI scalping optimizer dengan analisa win rate dan rekomendasi.
+    """
+    try:
+        optimizer = create_scalping_optimizer()
+        data = optimizer.analyze_scalping_performance(days=5)
+        msg = optimizer.format_scalping_analysis(data)
+        return msg
+    except Exception as e:
+        logger.error(f"Error in /scalping: {e}")
+        return f"❌ Error: {e}"
+
+
+async def create_ai_analysis_command(trading_bot) -> str:
+    """
+    Handler untuk /ai_analysis command.
+    AI-powered trading analysis using OpenRouter or other providers.
+    """
+    try:
+        # Get AI provider from bot if available
+        ai_provider = trading_bot.ai_provider if hasattr(trading_bot, "ai_provider") else None
+
+        # Call AI analysis
+        msg = await get_ai_trading_analysis(ai_provider, days=5)
+        return msg
+
+    except Exception as e:
+        logger.error(f"Error in /ai_analysis: {e}")
+        return f"❌ Error: {e}"
+
+
+async def create_professional_analysis_command() -> str:
+    """
+    Handler untuk /pro_analysis command.
+    Professional analysis last 5 days with mode recommendations for next week.
+    """
+    try:
+        analyzer = create_professional_analyzer()
+        analysis = analyzer.analyze_5_days()
+
+        msg = f"""<b>📊 PROFESSIONAL 5-DAY ANALYSIS</b>
+Date: {analysis.analysis_date} | Period: {analysis.period_days} days
+
+<b>📈 MARKET ASSESSMENT:</b>
+{analysis.market_assessment}
+
+<b>🔍 KEY FINDINGS:</b>"""
+
+        for finding in analysis.key_findings:
+            msg += f"\n  {finding}"
+
+        msg += f"\n\n<b>⚠️ RISK ASSESSMENT:</b>\n{analysis.risk_assessment}"
+
+        msg += "\n\n<b>🎯 MODE RECOMMENDATIONS FOR NEXT WEEK:</b>"
+        for i, rec in enumerate(analysis.mode_recommendations, 1):
+            conf_emoji = "🔴" if rec.confidence < 60 else "🟡" if rec.confidence < 80 else "🟢"
+            msg += f"""
+
+{i}. {conf_emoji} <b>{rec.mode}</b> (Confidence: {rec.confidence}%)
+   • {rec.reason}
+   • Expected: {rec.expected_performance}
+   • Risk Level: {rec.risk_level}"""
+
+        msg += f"\n\n<b>📋 NEXT WEEK STRATEGY:</b>\n{analysis.next_week_strategy}"
+
+        msg += "\n\n<b>✅ ACTION ITEMS:</b>"
+        for item in analysis.action_items:
+            msg += f"\n  {item}"
+
+        msg += f"\n\n⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB"
+        return msg.strip()
+
+    except Exception as e:
+        logger.error(f"Error in /pro_analysis: {e}")
+        return f"❌ Error: {e}"
+
+
+async def create_analysis_command() -> str:
+    """
+    Handler untuk /analysis command.
+    Analyze why no positions opened in last 3 days.
+    """
+    try:
+        analyzer = create_analyzer()
+        result = analyzer.analyze_no_positions(days=3)
+
+        # Build message sections
+        msg = f"""<b>📊 POSITION ANALYSIS</b>
+(Last {result.days_analyzed} days - {result.analysis_date})
+
+<b>Summary:</b>
+  • Total Signals: <code>{result.total_signals}</code>
+  • Total Trades: <code>{result.total_trades}</code>
+  • Execution Rate: <code>{result.execution_rate:.1f}%</code>
+  • Avg Confidence: <code>{result.avg_signal_confidence:.0%}</code>
+
+<b>Signals by Type:</b>
+  • BUY: <code>{result.signals_by_type.get('BUY', 0)}</code>
+  • SELL: <code>{result.signals_by_type.get('SELL', 0)}</code>
+  • NONE: <code>{result.signals_by_type.get('NONE', 0)}</code>
+
+<b>Market Regime:</b>"""
+
+        for regime, count in sorted(
+            result.regime_distribution.items(), key=lambda x: x[1], reverse=True
+        ):
+            msg += f"\n  • {regime}: <code>{count}</code> signals"
+
+        msg += "\n\n<b>Market Quality Breakdown:</b>"
+        for quality, count in sorted(
+            result.market_quality_breakdown.items(), key=lambda x: x[1], reverse=True
+        ):
+            msg += f"\n  • {quality}: <code>{count}</code> signals"
+
+        # Top blocking reasons
+        if result.top_blocking_reasons:
+            msg += "\n\n<b>Top Blocking Factors:</b>"
+            for reason, count in result.top_blocking_reasons[:5]:
+                pct = (count / result.total_signals * 100) if result.total_signals > 0 else 0
+                msg += f"\n  🚫 {reason}: <code>{count}</code> ({pct:.1f}%)"
+
+        # Trade results (if any)
+        if result.total_trades > 0:
+            msg += f"\n\n<b>Trade Results:</b>"
+            if result.win_rate is not None:
+                wr_emoji = "✅" if result.win_rate >= 50 else "⚠️"
+                msg += f"\n  {wr_emoji} Win Rate: <code>{result.win_rate:.1f}%</code>"
+            if result.total_profit is not None:
+                profit_emoji = "📈" if result.total_profit > 0 else "📉"
+                msg += f"\n  {profit_emoji} Total P/L: <code>${result.total_profit:+.2f}</code>"
+
+        # Key insights
+        msg += "\n\n<b>🎯 Key Insights:</b>"
+        for insight in result.key_insights:
+            msg += f"\n  {insight}"
+
+        msg += f"\n\n⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB"
+        return msg.strip()
+
+    except Exception as e:
+        logger.error(f"Error in /analysis: {e}")
+        return f"❌ Error: {e}"
+
+
+async def create_entries_list_command() -> str:
+    """
+    Handler untuk /entries command.
+    List semua available entry strategies.
+    """
+    try:
+        manager = get_entry_strategy_manager()
+        strategies = manager.list_strategies()
+        current = manager.get_current_strategy()
+
+        msg = """<b>📝 ENTRY STRATEGIES AVAILABLE</b>
+
+Entry strategy menentukan bagaimana bot validate entry signals:"""
+
+        for strategy_name, config in strategies.items():
+            current_marker = " ✅" if config["current"] else ""
+            msg += f"""
+
+<b>{config['emoji']} {strategy_name}{current_marker}</b>
+  {config['description']}
+  • Components: SMC={config['use_smc']}, ML={config['use_ml']}, AI={config['use_ai']}
+  • AI Primary: {config['ai_primary']}
+  • Min AI Confidence: {config['min_ai_confidence']}%"""
+
+        msg += f"""
+
+<b>Commands:</b>
+  /entry_info [STRATEGY] — Detail info strategy
+  /setentry [STRATEGY] — Switch to strategy
+
+<b>Current Strategy:</b> <code>{current.value}</code>
+
+⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB"""
+
+        return msg.strip()
+
+    except Exception as e:
+        logger.error(f"Error in /entries: {e}")
+        return f"❌ Error: {e}"
+
+
+async def create_entry_info_command(strategy_name: str = None) -> str:
+    """
+    Handler untuk /entry_info command.
+    Show detail info tentang specific entry strategy.
+    """
+    try:
+        manager = get_entry_strategy_manager()
+
+        if not strategy_name:
+            return await create_entries_list_command()
+
+        # Find strategy
+        try:
+            strategy = EntryStrategyType(strategy_name)
+        except ValueError:
+            return f"❌ Unknown strategy: {strategy_name}\n\nUse /entries untuk lihat available strategies"
+
+        msg = manager.get_strategy_info(strategy)
+        return msg
+
+    except Exception as e:
+        logger.error(f"Error in /entry_info: {e}")
+        return f"❌ Error: {e}"
+
+
+async def create_setentry_command(trading_bot, strategy_name: str = None) -> str:
+    """
+    Handler untuk /setentry command.
+    Switch entry strategy dan update bot config.
+    """
+    try:
+        manager = get_entry_strategy_manager()
+
+        if not strategy_name:
+            return f"""❌ No strategy specified!
+
+Usage: /setentry [STRATEGY]
+
+Available:
+  • SMC_ML_ONLY — Pure SMC+ML (fastest)
+  • SMC_ML_AI — SMC+ML with AI validation
+  • AI_PRIMARY — AI primary (most confident)
+
+Example: /setentry AI_PRIMARY"""
+
+        # Validate strategy
+        try:
+            strategy = EntryStrategyType(strategy_name)
+        except ValueError:
+            return f"❌ Unknown strategy: {strategy_name}"
+
+        # Set strategy
+        success = manager.set_strategy(strategy)
+        if not success:
+            return f"❌ Failed to set strategy: {strategy_name}"
+
+        # Apply to trading bot
+        manager.apply_strategy_to_trading(trading_bot)
+
+        config = manager.get_strategy_config(strategy)
+        msg = f"""<b>{config.emoji} ENTRY STRATEGY CHANGED</b>
+
+<b>New Strategy:</b> <code>{strategy.value}</code>
+
+<b>Description:</b> {config.description}
+
+<b>Settings Applied:</b>
+  ✅ Use SMC: {config.use_smc}
+  ✅ Use ML: {config.use_ml}
+  ✅ Use AI: {config.use_ai}
+  ✅ AI Primary: {config.ai_as_primary}
+  ✅ Min AI Confidence: {config.min_ai_confidence}%
+  ✅ Require AI Confirmation: {config.require_ai_confirmation}
+  ✅ Max AI Delay: {config.max_ai_delay_seconds}s
+
+Entry strategy akan aktif untuk signal berikutnya!
+
+⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB"""
+
+        return msg.strip()
+
+    except Exception as e:
+        logger.error(f"Error in /setentry: {e}")
+        return f"❌ Error: {e}"
+
+
 def register_default_commands(trading_bot, telegram_notifier):
     """
     Register semua default commands ke TelegramNotifier.
@@ -519,4 +897,70 @@ def register_default_commands(trading_bot, telegram_notifier):
     recommend_cmd._cmd_desc = "AI trading recommendation (ML + SMC + Macro)"
     telegram_notifier.register_command("recommend", recommend_cmd)
 
-    logger.info("Telegram commands registered: /balance, /positions, /status, /closeall, /terminate, /news, /recommend")
+    # /modes — list all trading modes
+    async def modes_cmd():
+        return await create_modes_command()
+    modes_cmd._cmd_desc = "List all available trading modes"
+    telegram_notifier.register_command("modes", modes_cmd)
+
+    # /mode_info — get info about specific mode
+    async def mode_info_cmd(args: str = ""):
+        mode_name = args.strip().upper() if args else None
+        if not mode_name:
+            return await create_modes_command()
+        return await create_mode_info_command(mode_name)
+    mode_info_cmd._cmd_desc = "Trading mode details (/mode_info AGGRESSIVE, etc)"
+    telegram_notifier.register_command("mode_info", mode_info_cmd, supports_args=True)
+
+    # /setmode — switch trading mode
+    async def setmode_cmd(args: str = ""):
+        mode_name = args.strip().upper() if args else None
+        return await create_setmode_command(trading_bot, mode_name)
+    setmode_cmd._cmd_desc = "Switch trading mode (AGGRESSIVE|NORMAL|CONSERVATIVE|RESTRICTED)"
+    telegram_notifier.register_command("setmode", setmode_cmd, supports_args=True)
+
+    # /analysis — analyze why no positions opened
+    async def analysis_cmd():
+        return await create_analysis_command()
+    analysis_cmd._cmd_desc = "Analyze last 3 days - why no positions opened?"
+    telegram_notifier.register_command("analysis", analysis_cmd)
+
+    # /pro_analysis — professional 5-day analysis with mode recommendations
+    async def pro_analysis_cmd():
+        return await create_professional_analysis_command()
+    pro_analysis_cmd._cmd_desc = "Professional 5-day analysis + mode recommendations for next week"
+    telegram_notifier.register_command("pro_analysis", pro_analysis_cmd)
+
+    # /ai_analysis — AI-powered analysis using OpenRouter
+    async def ai_analysis_cmd():
+        return await create_ai_analysis_command(trading_bot)
+    ai_analysis_cmd._cmd_desc = "AI analysis from OpenRouter (Deepseek/Claude/GPT)"
+    telegram_notifier.register_command("ai_analysis", ai_analysis_cmd)
+
+    # /scalping — AI scalping optimizer dengan 70% win rate analysis
+    async def scalping_cmd():
+        return await create_scalping_analysis_command()
+    scalping_cmd._cmd_desc = "Scalping optimizer analysis - 70% win rate target"
+    telegram_notifier.register_command("scalping", scalping_cmd)
+
+    # /entries — list all entry strategies available
+    async def entries_cmd():
+        return await create_entries_list_command()
+    entries_cmd._cmd_desc = "List all entry strategies (SMC_ML_ONLY, SMC_ML_AI, AI_PRIMARY)"
+    telegram_notifier.register_command("entries", entries_cmd)
+
+    # /entry_info — get info about specific entry strategy
+    async def entry_info_cmd(args: str = ""):
+        strategy_name = args.strip().upper() if args else None
+        return await create_entry_info_command(strategy_name)
+    entry_info_cmd._cmd_desc = "Entry strategy details (/entry_info SMC_ML_ONLY, etc)"
+    telegram_notifier.register_command("entry_info", entry_info_cmd, supports_args=True)
+
+    # /setentry — switch entry strategy
+    async def setentry_cmd(args: str = ""):
+        strategy_name = args.strip().upper() if args else None
+        return await create_setentry_command(trading_bot, strategy_name)
+    setentry_cmd._cmd_desc = "Switch entry strategy (SMC_ML_ONLY|SMC_ML_AI|AI_PRIMARY)"
+    telegram_notifier.register_command("setentry", setentry_cmd, supports_args=True)
+
+    logger.info("Telegram commands registered: /balance, /positions, /status, /closeall, /terminate, /news, /recommend, /modes, /setmode, /entries, /entry_info, /setentry, /analysis, /pro_analysis, /ai_analysis, /scalping")
